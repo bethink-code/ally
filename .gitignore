@@ -6,6 +6,5 @@ dist/
 .DS_Store
 *.log
 .vercel/
-api/index.mjs
 drizzle/
 Scratch/
