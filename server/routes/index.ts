@@ -7,8 +7,10 @@ import analysisRouter from "./analysis";
 
 export function registerRoutes(app: Express) {
   app.use(authRouter);
-  app.use(adminRouter);
+  // Admin routers are mounted under /api/admin so their blanket isAdmin
+  // middleware only applies to admin paths — NEVER mount these without a prefix.
+  app.use("/api/admin", adminRouter);
+  app.use("/api/admin", promptsRouter);
   app.use(statementsRouter);
-  app.use(promptsRouter);
   app.use(analysisRouter);
 }

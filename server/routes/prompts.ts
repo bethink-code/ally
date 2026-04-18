@@ -5,20 +5,21 @@ import { savePromptSchema } from "@shared/schema";
 import { listActivePrompts, listPromptVersions } from "../modules/prompts/getPrompt";
 import { savePromptVersion, rollbackTo } from "../modules/prompts/savePrompt";
 
+// Mounted at /api/admin — so all paths here are relative to that.
 const router = Router();
 router.use(isAdmin);
 
-router.get("/api/admin/prompts", async (_req, res) => {
+router.get("/prompts", async (_req, res) => {
   const rows = await listActivePrompts();
   res.json(rows);
 });
 
-router.get("/api/admin/prompts/:key/versions", async (req, res) => {
+router.get("/prompts/:key/versions", async (req, res) => {
   const rows = await listPromptVersions(req.params.key);
   res.json(rows);
 });
 
-router.post("/api/admin/prompts", async (req, res) => {
+router.post("/prompts", async (req, res) => {
   const parsed = savePromptSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "invalid_input", detail: parsed.error.flatten() });
@@ -36,7 +37,7 @@ router.post("/api/admin/prompts", async (req, res) => {
   res.json(created);
 });
 
-router.post("/api/admin/prompts/:key/rollback/:id", async (req, res) => {
+router.post("/prompts/:key/rollback/:id", async (req, res) => {
   const { key, id } = req.params;
   const activated = await rollbackTo(key, Number(id));
   audit({

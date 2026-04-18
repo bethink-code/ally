@@ -362,22 +362,22 @@ import { Router as Router2 } from "express";
 import { desc, eq as eq3, sql } from "drizzle-orm";
 var router2 = Router2();
 router2.use(isAdmin);
-router2.get("/api/admin/users", async (_req, res) => {
+router2.get("/users", async (_req, res) => {
   const rows = await db.select().from(users).orderBy(desc(users.createdAt));
   res.json(rows);
 });
-router2.patch("/api/admin/users/:id/admin", async (req, res) => {
+router2.patch("/users/:id/admin", async (req, res) => {
   const { id } = req.params;
   const { isAdmin: newFlag } = req.body;
   await db.update(users).set({ isAdmin: Boolean(newFlag) }).where(eq3(users.id, id));
   audit({ req, action: "admin.toggle_admin", resourceType: "user", resourceId: id, detail: { isAdmin: newFlag } });
   res.json({ ok: true });
 });
-router2.get("/api/admin/invites", async (_req, res) => {
+router2.get("/invites", async (_req, res) => {
   const rows = await db.select().from(invitedUsers).orderBy(desc(invitedUsers.createdAt));
   res.json(rows);
 });
-router2.post("/api/admin/invites", async (req, res) => {
+router2.post("/invites", async (req, res) => {
   const parsed = insertInviteSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid_input" });
   const email = parsed.data.email.toLowerCase();
@@ -386,17 +386,17 @@ router2.post("/api/admin/invites", async (req, res) => {
   audit({ req, action: "admin.invite_create", resourceType: "invite", detail: { email } });
   res.json(created ?? { email });
 });
-router2.delete("/api/admin/invites/:id", async (req, res) => {
+router2.delete("/invites/:id", async (req, res) => {
   const id = Number(req.params.id);
   await db.delete(invitedUsers).where(eq3(invitedUsers.id, id));
   audit({ req, action: "admin.invite_delete", resourceType: "invite", resourceId: String(id) });
   res.json({ ok: true });
 });
-router2.get("/api/admin/access-requests", async (_req, res) => {
+router2.get("/access-requests", async (_req, res) => {
   const rows = await db.select().from(accessRequests).orderBy(desc(accessRequests.createdAt));
   res.json(rows);
 });
-router2.patch("/api/admin/access-requests/:id", async (req, res) => {
+router2.patch("/access-requests/:id", async (req, res) => {
   const id = Number(req.params.id);
   const { status } = req.body;
   const actor = req.user;
@@ -407,11 +407,11 @@ router2.patch("/api/admin/access-requests/:id", async (req, res) => {
   audit({ req, action: "admin.access_request_decide", resourceType: "access_request", resourceId: String(id), detail: { status } });
   res.json(updated);
 });
-router2.get("/api/admin/audit-logs", async (_req, res) => {
+router2.get("/audit-logs", async (_req, res) => {
   const rows = await db.select().from(auditLogs).orderBy(desc(auditLogs.createdAt)).limit(500);
   res.json(rows);
 });
-router2.get("/api/admin/security-overview", async (_req, res) => {
+router2.get("/security-overview", async (_req, res) => {
   const [{ userCount }] = await db.select({ userCount: sql`count(*)::int` }).from(users);
   const [{ adminCount }] = await db.select({ adminCount: sql`count(*)::int` }).from(users).where(eq3(users.isAdmin, true));
   const [{ inviteCount }] = await db.select({ inviteCount: sql`count(*)::int` }).from(invitedUsers);
@@ -632,15 +632,15 @@ async function rollbackTo(promptKey, versionId) {
 // server/routes/prompts.ts
 var router4 = Router4();
 router4.use(isAdmin);
-router4.get("/api/admin/prompts", async (_req, res) => {
+router4.get("/prompts", async (_req, res) => {
   const rows = await listActivePrompts();
   res.json(rows);
 });
-router4.get("/api/admin/prompts/:key/versions", async (req, res) => {
+router4.get("/prompts/:key/versions", async (req, res) => {
   const rows = await listPromptVersions(req.params.key);
   res.json(rows);
 });
-router4.post("/api/admin/prompts", async (req, res) => {
+router4.post("/prompts", async (req, res) => {
   const parsed = savePromptSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "invalid_input", detail: parsed.error.flatten() });
@@ -656,7 +656,7 @@ router4.post("/api/admin/prompts", async (req, res) => {
   });
   res.json(created);
 });
-router4.post("/api/admin/prompts/:key/rollback/:id", async (req, res) => {
+router4.post("/prompts/:key/rollback/:id", async (req, res) => {
   const { key, id } = req.params;
   const activated = await rollbackTo(key, Number(id));
   audit({
@@ -839,9 +839,9 @@ var analysis_default = router5;
 // server/routes/index.ts
 function registerRoutes(app2) {
   app2.use(auth_default);
-  app2.use(admin_default);
+  app2.use("/api/admin", admin_default);
+  app2.use("/api/admin", prompts_default);
   app2.use(statements_default);
-  app2.use(prompts_default);
   app2.use(analysis_default);
 }
 
