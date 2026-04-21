@@ -1,5 +1,7 @@
+import { useEffect } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
+import { invalidateConversation } from "@/lib/invalidation";
 import { Button } from "@/components/ui/button";
 import { StoryRotator } from "@/components/StoryRotator";
 import { StoryArticle, type StoryAnalysisResult } from "@/components/StoryArticle";
@@ -25,6 +27,14 @@ export function FirstTakeGaps({ onGoBack }: { onGoBack?: () => void }) {
   const hasDoneResult = latest?.status === "done" && !!latest.result;
   const isRunning = latest?.status === "analysing" || run.isPending;
   const hasFailure = latest?.status === "failed";
+
+  // When a new analysis becomes available, invalidate the conversation query so
+  // the GET handler sees the fresh analysis id and fires the phase-transition
+  // opener. Without this, Ally only greets the user on the next chat action.
+  const doneAnalysisId = hasDoneResult ? latest?.id : undefined;
+  useEffect(() => {
+    if (doneAnalysisId) invalidateConversation(queryClient);
+  }, [doneAnalysisId]);
 
   return (
     <div className="flex flex-col h-full min-h-0">
