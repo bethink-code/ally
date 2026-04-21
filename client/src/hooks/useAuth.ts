@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
-type User = {
+export type AuthUser = {
   id: string;
   email: string;
   firstName: string | null;
@@ -12,9 +12,10 @@ type User = {
   buildCompletedAt: string | null;
   isAdmin: boolean;
   termsAcceptedAt: string | null;
+  createdAt: string;
 };
 
 export function useAuth() {
-  const { data, isLoading } = useQuery<User | null>({ queryKey: ["/api/auth/user"] });
+  const { data, isLoading } = useQuery<AuthUser | null>({ queryKey: ["/api/auth/user"] });
   return { user: data ?? null, isLoading };
 }

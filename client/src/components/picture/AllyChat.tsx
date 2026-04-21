@@ -1,0 +1,113 @@
+import { useEffect } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { invalidateConversation } from "@/lib/invalidation";
+import { useAuth } from "@/hooks/useAuth";
+import { LOADER_COPY } from "@/lib/uiCopy";
+import { Button } from "@/components/ui/button";
+import { MessageList } from "@/components/conversation/MessageList";
+import { ConversationInput } from "@/components/conversation/ConversationInput";
+import type { Conversation, ConversationMessage } from "@shared/schema";
+
+type ConversationResponse = {
+  conversation: Conversation | null;
+  messages: ConversationMessage[];
+};
+
+// Chat body for Ally's pane. No drawer, no modal — just the message stream + input.
+// Auto-starts the conversation the first time it mounts with no existing conversation.
+// Works in every phase: the backend varies its context block by whether an analysis exists,
+// but the client flow is identical (query → auto-start → send message).
+export function AllyChat() {
+  const { user } = useAuth();
+  const phase = user?.buildCompletedAt ? "first_take_gaps" : "bring_it_in";
+  const loader = LOADER_COPY[phase];
+
+  const q = useQuery<ConversationResponse>({
+    queryKey: ["/api/qa/conversation"],
+  });
+
+  const start = useMutation({
+    mutationFn: () => apiRequest("POST", "/api/qa/start"),
+    onSuccess: () => invalidateConversation(queryClient),
+  });
+
+  const send = useMutation({
+    mutationFn: (content: string) => apiRequest("POST", "/api/qa/message", { content }),
+    onSuccess: () => invalidateConversation(queryClient),
+  });
+
+  useEffect(() => {
+    if (
+      q.data &&
+      !q.data.conversation &&
+      !start.isPending &&
+      !start.isSuccess &&
+      !start.isError
+    ) {
+      start.mutate();
+    }
+  }, [q.data, start]);
+
+  const conversation = q.data?.conversation ?? null;
+  const messages = q.data?.messages ?? [];
+  const isComplete = conversation?.status === "complete";
+  const settling = q.isLoading || (!conversation && (start.isPending || (!start.isSuccess && !start.isError)));
+  const startError = start.error instanceof Error ? start.error.message : null;
+  const sendError = send.error instanceof Error ? send.error.message : null;
+  const queryError = q.error instanceof Error ? q.error.message : null;
+  const inputLocked = start.isPending || send.isPending || !conversation || isComplete;
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <main className="flex-1 overflow-y-auto px-6 py-8 min-h-0">
+        {settling ? (
+          <div className="flex flex-col items-start gap-2">
+            <div className="font-serif text-xl text-foreground/80">{loader.title}</div>
+            <div className="text-sm text-muted-foreground">{loader.sub}</div>
+          </div>
+        ) : queryError ? (
+          <ErrorBlock title="Couldn't load the conversation." detail={queryError} onRetry={() => q.refetch()} />
+        ) : (
+          <div className="space-y-6">
+            <MessageList messages={messages} awaitingReply={send.isPending} />
+            {startError && (
+              <ErrorBlock
+                title="Ally couldn't open the conversation."
+                detail={startError}
+                onRetry={() => {
+                  start.reset();
+                  start.mutate();
+                }}
+              />
+            )}
+            {sendError && (
+              <ErrorBlock
+                title="Ally didn't reply."
+                detail={sendError}
+                onRetry={() => send.reset()}
+              />
+            )}
+            {isComplete && (
+              <div className="text-sm italic text-muted-foreground">Conversation complete.</div>
+            )}
+          </div>
+        )}
+      </main>
+
+      <ConversationInput onSend={(content) => send.mutate(content)} disabled={inputLocked} />
+    </div>
+  );
+}
+
+function ErrorBlock({ title, detail, onRetry }: { title: string; detail: string; onRetry: () => void }) {
+  return (
+    <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 space-y-2">
+      <div className="text-sm font-medium">{title}</div>
+      <pre className="whitespace-pre-wrap break-words text-xs text-muted-foreground">{detail}</pre>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        Try again
+      </Button>
+    </div>
+  );
+}

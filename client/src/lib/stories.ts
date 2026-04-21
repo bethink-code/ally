@@ -1,4 +1,4 @@
-// Short, hopeful financial stories shown while Kin is reading statements.
+// Short, hopeful financial stories shown while Ally is reading statements.
 // Kept deliberately brief and quietly specific — the point is not drama,
 // it's the feeling that someone else has been where you are and came out okay.
 //

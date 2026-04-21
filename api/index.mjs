@@ -27,6 +27,8 @@ __export(schema_exports, {
   accessRequests: () => accessRequests,
   analyses: () => analyses,
   auditLogs: () => auditLogs,
+  conversationMessages: () => conversationMessages,
+  conversations: () => conversations,
   insertAccessRequestSchema: () => insertAccessRequestSchema,
   insertInviteSchema: () => insertInviteSchema,
   invitedUsers: () => invitedUsers,
@@ -142,6 +144,45 @@ var analyses = pgTable("analyses", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
   completedAt: timestamp("completed_at")
 });
+var conversations = pgTable("conversations", {
+  id: serial("id").primaryKey(),
+  userId: text("user_id").notNull().unique().references(() => users.id),
+  status: text("status").notNull().default("active"),
+  // active | paused | complete
+  profile: jsonb("profile"),
+  // accumulated QaProfile — what the agent has confirmed so far
+  flaggedIssues: jsonb("flagged_issues"),
+  // array of plain-language flags the agent has surfaced
+  analysisIdAtStart: integer("analysis_id_at_start").references(() => analyses.id),
+  startedAt: timestamp("started_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  completedAt: timestamp("completed_at")
+});
+var conversationMessages = pgTable(
+  "conversation_messages",
+  {
+    id: serial("id").primaryKey(),
+    conversationId: integer("conversation_id").notNull().references(() => conversations.id),
+    role: text("role").notNull(),
+    // user | assistant
+    content: text("content").notNull(),
+    profileUpdates: jsonb("profile_updates"),
+    // what the assistant extracted on this turn (null for user messages)
+    status: text("status"),
+    // what the assistant set conversation status to on this turn
+    // Assistant messages generated at a phase boundary (conversation start, phase transition).
+    // The client renders these with a distinct visual treatment so the user sees them as
+    // Ally orienting them to a new step rather than a regular reply.
+    isTransition: boolean("is_transition").notNull().default(false),
+    promptVersionId: integer("prompt_version_id").references(() => systemPrompts.id),
+    inputTokens: integer("input_tokens"),
+    outputTokens: integer("output_tokens"),
+    cacheReadTokens: integer("cache_read_tokens"),
+    cacheCreationTokens: integer("cache_creation_tokens"),
+    createdAt: timestamp("created_at").notNull().defaultNow()
+  },
+  (t) => [index("idx_conversation_messages_conversation_id").on(t.conversationId)]
+);
 var insertAccessRequestSchema = createInsertSchema(accessRequests).pick({
   name: true,
   email: true,
@@ -836,6 +877,501 @@ router5.post("/api/analysis/run", async (req, res) => {
 });
 var analysis_default = router5;
 
+// server/routes/qa.ts
+import { Router as Router6 } from "express";
+import { z as z6 } from "zod";
+import { and as and6, asc, desc as desc6, eq as eq9 } from "drizzle-orm";
+
+// server/modules/qa/persistTurn.ts
+import { and as and5, eq as eq8 } from "drizzle-orm";
+
+// server/modules/qa/chat.ts
+import Anthropic3 from "@anthropic-ai/sdk";
+import { zodOutputFormat as zodOutputFormat3 } from "@anthropic-ai/sdk/helpers/zod";
+
+// server/modules/qa/schema.ts
+import { z as z5 } from "zod/v4";
+var qaProfileSchema = z5.object({
+  corrections: z5.array(z5.string()).describe("Things the user said were wrong in their story. Short statements, one per correction."),
+  otherAccounts: z5.string().describe("Notes on accounts not visible in the uploaded statements (other banks, savings, investments, credit cards). Empty string if not yet discussed."),
+  incomeContext: z5.string().describe("Notes on income stability, source concentration, side income. Empty string if not yet discussed."),
+  debt: z5.string().describe("Notes on debts not visible in statements (store accounts, family loans, other bank credit cards). Empty string if not yet discussed."),
+  medicalCover: z5.string().describe("Notes on medical aid / hospital cover status. Empty string if not yet discussed."),
+  lifeCover: z5.string().describe("Notes on life cover and who depends on the user's income. Empty string if not yet discussed."),
+  incomeProtection: z5.string().describe("Notes on income protection cover. Empty string if not yet discussed."),
+  retirement: z5.string().describe("Notes on retirement savings \u2014 RA, employer fund, provident fund, etc. Empty string if not yet discussed."),
+  tax: z5.string().describe("Notes on tax situation \u2014 PAYE, provisional, VAT, company salary. Empty string if not yet discussed."),
+  property: z5.string().describe("Notes on property ownership, bonds, rental. Empty string if not yet discussed."),
+  goals: z5.array(z5.string()).describe("What the user wants \u2014 VERBATIM in their own words. Do not reword into financial jargon."),
+  lifeContext: z5.string().describe("Notes on dependents, partner, living situation, life stage. Empty string if not yet discussed."),
+  will: z5.string().describe("Notes on will / estate planning. Empty string if not yet discussed.")
+});
+var qaProfileUpdateSchema = qaProfileSchema;
+var qaTurnResultSchema = z5.object({
+  reply: z5.string().describe(
+    "What to say back to the user. Short \u2014 a few sentences, never a wall of text. No formatting (no bullets, bold, headers, lists). Conversational. One question at a time, never two."
+  ),
+  profileUpdates: qaProfileUpdateSchema.describe(
+    "Your full current view of the profile. For topics you didn't address this turn, pass an empty string (or empty array for corrections/goals). The server merges: non-empty strings overwrite existing notes, arrays are appended and deduped."
+  ),
+  newFlaggedIssues: z5.array(z5.string()).describe(
+    "NEW key issues to flag from what the user just said. One short sentence each. Do not repeat previously flagged issues. Empty array if nothing new to flag."
+  ),
+  status: z5.enum(["continuing", "minimum_viable", "complete"]).describe(
+    "continuing = more to gather; minimum_viable = enough for a picture but could gather more; complete = nothing essential left to gather."
+  )
+});
+function emptyProfile() {
+  return {
+    corrections: [],
+    otherAccounts: "",
+    incomeContext: "",
+    debt: "",
+    medicalCover: "",
+    lifeCover: "",
+    incomeProtection: "",
+    retirement: "",
+    tax: "",
+    property: "",
+    goals: [],
+    lifeContext: "",
+    will: ""
+  };
+}
+
+// server/modules/qa/chat.ts
+var client3 = new Anthropic3();
+async function runQaTurn(input) {
+  const { stable, dynamic } = buildContextBlocks(input);
+  const response = await client3.messages.parse({
+    model: input.model,
+    max_tokens: 2e3,
+    system: [
+      {
+        type: "text",
+        text: input.systemPrompt,
+        cache_control: { type: "ephemeral" }
+      }
+    ],
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: stable, cache_control: { type: "ephemeral" } },
+          { type: "text", text: dynamic }
+        ]
+      },
+      ...input.history.map((m) => ({ role: m.role, content: m.content })),
+      ...input.latestUser !== null ? [{ role: "user", content: input.latestUser }] : []
+    ],
+    output_config: { format: zodOutputFormat3(qaTurnResultSchema) }
+  });
+  if (!response.parsed_output) {
+    throw new Error("QA turn returned no parsed output");
+  }
+  return {
+    result: response.parsed_output,
+    usage: {
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+      cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+      cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0
+    }
+  };
+}
+function buildContextBlocks(input) {
+  const stable = buildStableContext(input);
+  const dynamic = buildDynamicContext(input);
+  return { stable, dynamic };
+}
+function buildStableContext(input) {
+  const who = input.user.firstName ? `You're speaking with ${input.user.firstName}.` : `You're speaking with a user whose first name you don't know \u2014 avoid using a name.`;
+  const statementsBlock = input.statements.length === 0 ? "(no statements uploaded yet)" : input.statements.map((s) => formatStatementLine(s)).join("\n");
+  const sections = [who, "", `## Current phase: ${input.phase}`];
+  if (input.phase === "bring_it_in") {
+    sections.push(
+      "They are uploading statements. You do NOT have an analysis yet \u2014 don't pretend to. Your job here is to reassure, answer process questions (why statements, what format, what if they have fewer than 12, privacy), and encourage them to keep uploading. Do NOT drive through gaps yet \u2014 that's for the next phase."
+    );
+  } else if (input.phase === "analysing") {
+    sections.push(
+      `They've finished uploading and clicked "show me my picture". The analysis is running in the background right now and will finish shortly. You do NOT have the analysis yet. Do NOT ask for more statements \u2014 they're done with that. Do NOT drive through gaps \u2014 you don't have the story yet. If they ask what to do next, tell them the analysis is running (should take about a minute) and then you'll go through the story together. Stay light.`
+    );
+  } else {
+    sections.push(
+      "They've uploaded statements and the analysis has run. The story on the left is yours. Your job now is to drive through the gaps \u2014 corrections first, then what statements couldn't show, then safety nets, goals, life context."
+    );
+  }
+  sections.push("", "## Statements so far", statementsBlock, "");
+  if (input.analysis) {
+    sections.push(
+      "## Their financial story (from the Analysis phase)",
+      "```json",
+      JSON.stringify(input.analysis, null, 2),
+      "```",
+      ""
+    );
+  }
+  return sections.join("\n");
+}
+function buildDynamicContext(input) {
+  const sections = [
+    "## What you've already learned from them (running profile)",
+    "```json",
+    JSON.stringify(input.profile, null, 2),
+    "```",
+    "",
+    "## Issues you've already flagged (don't repeat these)",
+    input.flaggedIssues.length === 0 ? "(none yet)" : input.flaggedIssues.map((f) => `- ${f}`).join("\n"),
+    ""
+  ];
+  if (input.historyTruncated) {
+    sections.push(
+      "## Memory note",
+      "Earlier turns of this conversation have been trimmed \u2014 you only see the recent messages below. Everything meaningful from earlier is captured in the running profile above. If the user references something older that isn't in the profile, it's fine to ask again.",
+      ""
+    );
+  }
+  const opening = input.latestUser === null ? input.phase === "first_take_gaps" ? "The conversation hasn't started yet. Greet them warmly, acknowledge the story they've just read, state privacy in one line, set the expectation that this takes about 10 minutes, and ask your first correction-check question." : input.phase === "analysing" ? "The conversation hasn't started yet. Greet them warmly and tell them the analysis is running \u2014 it'll be ready in a minute." : "The conversation hasn't started yet. Greet them warmly, explain in one or two sentences why you need their bank statements, and invite them to drop pdfs on the left. Privacy in one line. Ask if they have any questions before they start." : "The conversation history follows. Respond to their most recent message.";
+  sections.push(opening);
+  return sections.join("\n");
+}
+function formatStatementLine(s) {
+  if (s.status === "extracted") {
+    const bits = [s.filename];
+    if (s.bankName) bits.push(s.bankName);
+    if (s.periodStart && s.periodEnd) bits.push(`${s.periodStart} \u2192 ${s.periodEnd}`);
+    if (s.transactionCount != null) bits.push(`${s.transactionCount} transactions`);
+    return `- ${bits.join(" \xB7 ")}`;
+  }
+  return `- ${s.filename} (${s.status})`;
+}
+
+// server/modules/qa/mergeProfile.ts
+function mergeProfile(existing, updates) {
+  if (!updates) return existing;
+  return {
+    corrections: concatDedup(existing.corrections, updates.corrections),
+    otherAccounts: preferUpdate(existing.otherAccounts, updates.otherAccounts),
+    incomeContext: preferUpdate(existing.incomeContext, updates.incomeContext),
+    debt: preferUpdate(existing.debt, updates.debt),
+    medicalCover: preferUpdate(existing.medicalCover, updates.medicalCover),
+    lifeCover: preferUpdate(existing.lifeCover, updates.lifeCover),
+    incomeProtection: preferUpdate(existing.incomeProtection, updates.incomeProtection),
+    retirement: preferUpdate(existing.retirement, updates.retirement),
+    tax: preferUpdate(existing.tax, updates.tax),
+    property: preferUpdate(existing.property, updates.property),
+    goals: concatDedup(existing.goals, updates.goals),
+    lifeContext: preferUpdate(existing.lifeContext, updates.lifeContext),
+    will: preferUpdate(existing.will, updates.will)
+  };
+}
+function mergeFlaggedIssues(existing, incoming) {
+  if (!incoming || incoming.length === 0) return existing;
+  return concatDedup(existing, incoming);
+}
+function preferUpdate(existing, update) {
+  if (typeof update !== "string") return existing;
+  return update.trim().length > 0 ? update : existing;
+}
+function concatDedup(existing, incoming) {
+  if (!incoming || incoming.length === 0) return existing;
+  const seen = new Set(existing);
+  const out = [...existing];
+  for (const s of incoming) {
+    if (!seen.has(s)) {
+      out.push(s);
+      seen.add(s);
+    }
+  }
+  return out;
+}
+
+// server/modules/qa/persistTurn.ts
+async function runAndPersistTurn(input) {
+  const { result, usage } = await runQaTurn({
+    systemPrompt: input.prompt.content,
+    model: input.prompt.model,
+    user: input.user,
+    phase: input.phase,
+    analysis: input.analysis,
+    statements: input.statements,
+    profile: input.profile,
+    flaggedIssues: input.flaggedIssues,
+    history: input.history,
+    historyTruncated: input.historyTruncated,
+    latestUser: input.latestUser
+  });
+  const [assistantMessage] = await db.insert(conversationMessages).values({
+    conversationId: input.conversationId,
+    role: "assistant",
+    content: result.reply,
+    profileUpdates: result.profileUpdates,
+    status: result.status,
+    isTransition: input.isTransition ?? false,
+    promptVersionId: input.prompt.id,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheCreationTokens: usage.cacheCreationTokens
+  }).returning();
+  const mergedProfile = mergeProfile(input.profile, result.profileUpdates);
+  const mergedFlags = mergeFlaggedIssues(input.flaggedIssues, result.newFlaggedIssues);
+  const newStatus = result.status === "complete" ? "complete" : "active";
+  const [conversation] = await db.update(conversations).set({
+    profile: mergedProfile,
+    flaggedIssues: mergedFlags,
+    status: newStatus,
+    updatedAt: /* @__PURE__ */ new Date(),
+    completedAt: newStatus === "complete" ? /* @__PURE__ */ new Date() : null
+  }).where(and5(eq8(conversations.id, input.conversationId), eq8(conversations.userId, input.userId))).returning();
+  return { conversation, assistantMessage };
+}
+
+// server/routes/qa.ts
+function derivePhase(buildCompletedAt, analysisResult) {
+  if (!buildCompletedAt) return "bring_it_in";
+  if (!analysisResult) return "analysing";
+  return "first_take_gaps";
+}
+function summariseStatements(rows) {
+  return rows.map((s) => {
+    const r = s.extractionResult ?? null;
+    return {
+      filename: s.filename,
+      status: s.status,
+      bankName: r?.bankName ?? null,
+      periodStart: r?.statementPeriodStart ?? null,
+      periodEnd: r?.statementPeriodEnd ?? null,
+      transactionCount: Array.isArray(r?.transactions) ? r.transactions.length : null
+    };
+  });
+}
+var router6 = Router6();
+router6.use(isAuthenticated);
+var messageBodySchema = z6.object({
+  content: z6.string().min(1).max(5e3)
+});
+var MAX_HISTORY_MESSAGES = 12;
+router6.get("/api/qa/conversation", async (req, res) => {
+  const user = req.user;
+  const [conversation] = await db.select().from(conversations).where(eq9(conversations.userId, user.id)).limit(1);
+  if (!conversation) {
+    return res.json({ conversation: null, messages: [] });
+  }
+  const [latestAnalysis] = await db.select().from(analyses).where(and6(eq9(analyses.userId, user.id), eq9(analyses.status, "done"))).orderBy(desc6(analyses.createdAt)).limit(1);
+  const currentPhase = derivePhase(user.buildCompletedAt, latestAnalysis?.result);
+  const needsTransitionOpener = currentPhase === "first_take_gaps" && latestAnalysis?.id !== void 0 && latestAnalysis.id !== conversation.analysisIdAtStart;
+  if (needsTransitionOpener && latestAnalysis?.result) {
+    const prompt = await getActivePrompt("qa");
+    if (prompt) {
+      const userStatements = await db.select().from(statements).where(eq9(statements.userId, user.id));
+      const runningProfile = conversation.profile ?? emptyProfile();
+      const runningFlags = conversation.flaggedIssues ?? [];
+      try {
+        await runAndPersistTurn({
+          conversationId: conversation.id,
+          userId: user.id,
+          prompt,
+          user: { firstName: user.firstName, email: user.email },
+          phase: currentPhase,
+          analysis: latestAnalysis.result,
+          statements: summariseStatements(userStatements),
+          profile: runningProfile,
+          flaggedIssues: runningFlags,
+          history: [],
+          historyTruncated: false,
+          latestUser: null,
+          isTransition: true
+        });
+        await db.update(conversations).set({ analysisIdAtStart: latestAnalysis.id, updatedAt: /* @__PURE__ */ new Date() }).where(eq9(conversations.id, conversation.id));
+        audit({
+          req,
+          action: "qa.phase_transition_opener",
+          resourceType: "conversation",
+          resourceId: String(conversation.id),
+          detail: { phase: currentPhase, analysisId: latestAnalysis.id }
+        });
+      } catch (err) {
+        console.error("[qa.conversation] transition opener failed:", err);
+      }
+    }
+  }
+  const [refreshed] = await db.select().from(conversations).where(eq9(conversations.id, conversation.id)).limit(1);
+  const messages = await loadMessages(conversation.id);
+  res.json({ conversation: refreshed ?? conversation, messages });
+});
+router6.post("/api/qa/start", async (req, res) => {
+  const user = req.user;
+  const [existing] = await db.select().from(conversations).where(eq9(conversations.userId, user.id)).limit(1);
+  if (existing) {
+    const existingMessages = await loadMessages(existing.id);
+    if (existingMessages.length > 0) {
+      return res.json({ conversation: existing, messages: existingMessages });
+    }
+  }
+  const [latestAnalysis] = await db.select().from(analyses).where(and6(eq9(analyses.userId, user.id), eq9(analyses.status, "done"))).orderBy(desc6(analyses.createdAt)).limit(1);
+  const userStatements = await db.select().from(statements).where(eq9(statements.userId, user.id));
+  const phase = derivePhase(user.buildCompletedAt, latestAnalysis?.result);
+  const promptKey = phase === "first_take_gaps" ? "qa" : "qa_bring_it_in";
+  const prompt = await getActivePrompt(promptKey);
+  if (!prompt) {
+    return res.status(500).json({ error: "no_active_qa_prompt", detail: { promptKey } });
+  }
+  const profile = emptyProfile();
+  const created = existing ? existing : (await db.insert(conversations).values({
+    userId: user.id,
+    status: "active",
+    profile,
+    flaggedIssues: [],
+    analysisIdAtStart: latestAnalysis?.id ?? null
+  }).returning())[0];
+  audit({
+    req,
+    action: existing ? "qa.conversation_restart_opener" : "qa.conversation_start",
+    resourceType: "conversation",
+    resourceId: String(created.id),
+    detail: { analysisId: latestAnalysis?.id ?? null }
+  });
+  try {
+    const { conversation, assistantMessage } = await runAndPersistTurn({
+      conversationId: created.id,
+      userId: user.id,
+      prompt,
+      user: { firstName: user.firstName, email: user.email },
+      phase,
+      analysis: latestAnalysis?.result ?? null,
+      statements: summariseStatements(userStatements),
+      profile,
+      flaggedIssues: [],
+      history: [],
+      historyTruncated: false,
+      latestUser: null,
+      isTransition: true
+    });
+    res.json({ conversation, messages: [assistantMessage] });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "unknown_error";
+    console.error("[qa.start] Claude call failed:", err);
+    audit({
+      req,
+      action: "qa.conversation_start_failed",
+      resourceType: "conversation",
+      resourceId: String(created.id),
+      outcome: "failure",
+      detail: { message }
+    });
+    res.status(500).json({ error: "qa_start_failed", message });
+  }
+});
+router6.post("/api/qa/message", async (req, res) => {
+  const user = req.user;
+  const parsed = messageBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "invalid_input", detail: parsed.error.flatten() });
+  }
+  const [conversation] = await db.select().from(conversations).where(eq9(conversations.userId, user.id)).limit(1);
+  if (!conversation) {
+    return res.status(404).json({ error: "no_conversation" });
+  }
+  if (conversation.status === "complete") {
+    return res.status(400).json({ error: "conversation_complete" });
+  }
+  const [latestAnalysis] = await db.select().from(analyses).where(and6(eq9(analyses.userId, user.id), eq9(analyses.status, "done"))).orderBy(desc6(analyses.createdAt)).limit(1);
+  const userStatements = await db.select().from(statements).where(eq9(statements.userId, user.id));
+  const phase = derivePhase(user.buildCompletedAt, latestAnalysis?.result);
+  const promptKey = phase === "first_take_gaps" ? "qa" : "qa_bring_it_in";
+  const prompt = await getActivePrompt(promptKey);
+  if (!prompt) {
+    return res.status(500).json({ error: "no_active_qa_prompt", detail: { promptKey } });
+  }
+  const [userMsg] = await db.insert(conversationMessages).values({
+    conversationId: conversation.id,
+    role: "user",
+    content: parsed.data.content
+  }).returning();
+  audit({
+    req,
+    action: "qa.message_send",
+    resourceType: "conversation",
+    resourceId: String(conversation.id)
+  });
+  const priorMessages = await loadMessages(conversation.id);
+  const fullHistory = priorMessages.filter((m) => m.id !== userMsg.id).map((m) => ({ role: m.role, content: m.content }));
+  const historyForModel = fullHistory.slice(-MAX_HISTORY_MESSAGES);
+  const historyTruncated = fullHistory.length > historyForModel.length;
+  const runningProfile = conversation.profile ?? emptyProfile();
+  const runningFlags = conversation.flaggedIssues ?? [];
+  try {
+    const { conversation: updated, assistantMessage } = await runAndPersistTurn({
+      conversationId: conversation.id,
+      userId: user.id,
+      prompt,
+      user: { firstName: user.firstName, email: user.email },
+      analysis: latestAnalysis?.result ?? null,
+      statements: summariseStatements(userStatements),
+      profile: runningProfile,
+      flaggedIssues: runningFlags,
+      history: historyForModel,
+      historyTruncated,
+      latestUser: parsed.data.content
+    });
+    if (updated.status === "complete") {
+      audit({
+        req,
+        action: "qa.conversation_complete",
+        resourceType: "conversation",
+        resourceId: String(conversation.id)
+      });
+    }
+    res.json({ conversation: updated, userMessage: userMsg, assistantMessage });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "unknown_error";
+    console.error("[qa.message] Claude call failed:", err);
+    audit({
+      req,
+      action: "qa.message_failed",
+      resourceType: "conversation",
+      resourceId: String(conversation.id),
+      outcome: "failure",
+      detail: { message }
+    });
+    res.status(500).json({ error: "qa_message_failed", message });
+  }
+});
+router6.post("/api/qa/pause", async (req, res) => {
+  const user = req.user;
+  const [updated] = await db.update(conversations).set({ status: "paused", updatedAt: /* @__PURE__ */ new Date() }).where(and6(eq9(conversations.userId, user.id), eq9(conversations.status, "active"))).returning();
+  if (!updated) {
+    return res.status(404).json({ error: "no_active_conversation" });
+  }
+  audit({
+    req,
+    action: "qa.conversation_pause",
+    resourceType: "conversation",
+    resourceId: String(updated.id)
+  });
+  res.json(updated);
+});
+router6.post("/api/qa/complete", async (req, res) => {
+  const user = req.user;
+  const [updated] = await db.update(conversations).set({ status: "complete", completedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq9(conversations.userId, user.id)).returning();
+  if (!updated) {
+    return res.status(404).json({ error: "no_conversation" });
+  }
+  audit({
+    req,
+    action: "qa.conversation_complete",
+    resourceType: "conversation",
+    resourceId: String(updated.id),
+    detail: { source: "manual" }
+  });
+  res.json(updated);
+});
+async function loadMessages(conversationId) {
+  return db.select().from(conversationMessages).where(eq9(conversationMessages.conversationId, conversationId)).orderBy(asc(conversationMessages.createdAt), asc(conversationMessages.id));
+}
+var qa_default = router6;
+
 // server/routes/index.ts
 function registerRoutes(app2) {
   app2.use(auth_default);
@@ -843,6 +1379,7 @@ function registerRoutes(app2) {
   app2.use("/api/admin", prompts_default);
   app2.use(statements_default);
   app2.use(analysis_default);
+  app2.use(qa_default);
 }
 
 // server/api.ts

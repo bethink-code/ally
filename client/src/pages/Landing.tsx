@@ -34,7 +34,7 @@ export default function Landing() {
     <div className="min-h-screen flex items-center justify-center px-6">
       <div className="max-w-md w-full space-y-8">
         <div className="text-center space-y-3">
-          <h1 className="text-5xl">Kin</h1>
+          <h1 className="text-5xl">Ally</h1>
           <p className="text-muted-foreground">A warm, honest mirror for your money.</p>
         </div>
 

@@ -115,6 +115,44 @@ export const analyses = pgTable("analyses", {
   completedAt: timestamp("completed_at"),
 });
 
+// Conversational Q&A — one live conversation per user.
+// Continues across analysis re-runs; agent always sees the latest analysis context each turn.
+export const conversations = pgTable("conversations", {
+  id: serial("id").primaryKey(),
+  userId: text("user_id").notNull().unique().references(() => users.id),
+  status: text("status").notNull().default("active"), // active | paused | complete
+  profile: jsonb("profile"), // accumulated QaProfile — what the agent has confirmed so far
+  flaggedIssues: jsonb("flagged_issues"), // array of plain-language flags the agent has surfaced
+  analysisIdAtStart: integer("analysis_id_at_start").references(() => analyses.id),
+  startedAt: timestamp("started_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  completedAt: timestamp("completed_at"),
+});
+
+// Messages within a conversation — append-only log of turns.
+export const conversationMessages = pgTable(
+  "conversation_messages",
+  {
+    id: serial("id").primaryKey(),
+    conversationId: integer("conversation_id").notNull().references(() => conversations.id),
+    role: text("role").notNull(), // user | assistant
+    content: text("content").notNull(),
+    profileUpdates: jsonb("profile_updates"), // what the assistant extracted on this turn (null for user messages)
+    status: text("status"), // what the assistant set conversation status to on this turn
+    // Assistant messages generated at a phase boundary (conversation start, phase transition).
+    // The client renders these with a distinct visual treatment so the user sees them as
+    // Ally orienting them to a new step rather than a regular reply.
+    isTransition: boolean("is_transition").notNull().default(false),
+    promptVersionId: integer("prompt_version_id").references(() => systemPrompts.id),
+    inputTokens: integer("input_tokens"),
+    outputTokens: integer("output_tokens"),
+    cacheReadTokens: integer("cache_read_tokens"),
+    cacheCreationTokens: integer("cache_creation_tokens"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("idx_conversation_messages_conversation_id").on(t.conversationId)]
+);
+
 // Zod schemas
 export const insertAccessRequestSchema = createInsertSchema(accessRequests).pick({
   name: true,
@@ -149,3 +187,5 @@ export type AuditLog = typeof auditLogs.$inferSelect;
 export type SystemPrompt = typeof systemPrompts.$inferSelect;
 export type Statement = typeof statements.$inferSelect;
 export type Analysis = typeof analyses.$inferSelect;
+export type Conversation = typeof conversations.$inferSelect;
+export type ConversationMessage = typeof conversationMessages.$inferSelect;

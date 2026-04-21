@@ -31,3 +31,9 @@ export function formatDate(d: Date | string): string {
   const date = typeof d === "string" ? new Date(d) : d;
   return date.toLocaleString();
 }
+
+// Long, editorial date: "14 April 2026"
+export function formatDateLong(d: Date | string): string {
+  const date = typeof d === "string" ? new Date(d) : d;
+  return date.toLocaleDateString("en-ZA", { day: "numeric", month: "long", year: "numeric" });
+}

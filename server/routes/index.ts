@@ -4,6 +4,7 @@ import adminRouter from "./admin";
 import statementsRouter from "./statements";
 import promptsRouter from "./prompts";
 import analysisRouter from "./analysis";
+import qaRouter from "./qa";
 
 export function registerRoutes(app: Express) {
   app.use(authRouter);
@@ -13,4 +14,5 @@ export function registerRoutes(app: Express) {
   app.use("/api/admin", promptsRouter);
   app.use(statementsRouter);
   app.use(analysisRouter);
+  app.use(qaRouter);
 }

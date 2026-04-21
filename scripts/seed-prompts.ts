@@ -1,6 +1,7 @@
 import { db } from "../server/db";
 import { systemPrompts, users } from "../shared/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { QA_STARTER_PROMPT, BRING_IT_IN_STARTER_PROMPT } from "../server/modules/qa/starterPrompt";
 
 const EXTRACTION_PROMPT = `You are an assistant that reads South African bank statement PDFs and extracts their structured contents.
 
@@ -26,7 +27,7 @@ Ground rules:
 
 Output must match the provided JSON schema exactly.`;
 
-const ANALYSIS_PROMPT = `You are Kin's analyst. You read someone's real bank statements and write back — in warm, plain, human language — what you see. You are not a dashboard. You are not a financial adviser. You are a thoughtful friend who happens to be good with numbers and has just been trusted with someone's complete picture.
+const ANALYSIS_PROMPT = `You are Ally's analyst. You read someone's real bank statements and write back — in warm, plain, human language — what you see. You are not a dashboard. You are not a financial adviser. You are a thoughtful friend who happens to be good with numbers and has just been trusted with someone's complete picture.
 
 You will be given a set of extracted South African bank statements as JSON. Analyse the ENTIRE SET together, not one statement at a time. Look across months. Find rhythms.
 
@@ -99,26 +100,67 @@ const PROMPTS = [
     model: "claude-sonnet-4-6",
     content: ANALYSIS_PROMPT,
   },
+  {
+    promptKey: "qa",
+    label: "Conversational Q&A — first take & gaps",
+    description: "Drives the post-analysis conversation: corrections, accounts not visible, safety nets, goals, life context. Flags key issues. No advice, no recommendations.",
+    model: "claude-sonnet-4-6",
+    content: QA_STARTER_PROMPT,
+  },
+  {
+    promptKey: "qa_bring_it_in",
+    label: "Ally — bring-it-in coaching",
+    description: "Runs while the user is uploading statements (no analysis yet). Reassures, answers process questions (why, format, how many, privacy), encourages uploading. Doesn't drive through financial gaps.",
+    model: "claude-sonnet-4-6",
+    content: BRING_IT_IN_STARTER_PROMPT,
+  },
 ];
 
 const SEED_EMAIL = "garth@bethink.co.za";
+const FORCE = process.argv.includes("--force");
+const ONLY = process.argv
+  .find((a) => a.startsWith("--only="))
+  ?.slice("--only=".length);
 
 const [seedUser] = await db.select().from(users).where(eq(users.email, SEED_EMAIL));
 const createdBy = seedUser?.id ?? null;
 
 for (const p of PROMPTS) {
-  const [existing] = await db.select().from(systemPrompts).where(eq(systemPrompts.promptKey, p.promptKey));
-  if (existing) {
-    console.log(`[seed-prompts] ${p.promptKey} — already exists (v${existing.version}), skipping.`);
+  if (ONLY && p.promptKey !== ONLY) continue;
+
+  const [existing] = await db
+    .select()
+    .from(systemPrompts)
+    .where(and(eq(systemPrompts.promptKey, p.promptKey), eq(systemPrompts.isActive, true)));
+
+  if (!existing) {
+    await db.insert(systemPrompts).values({ ...p, version: 1, isActive: true, createdBy });
+    console.log(`[seed-prompts] ${p.promptKey} — seeded v1.`);
     continue;
   }
+
+  if (existing.content === p.content && existing.model === p.model && existing.label === p.label) {
+    console.log(`[seed-prompts] ${p.promptKey} — up to date (v${existing.version}).`);
+    continue;
+  }
+
+  if (!FORCE) {
+    console.log(`[seed-prompts] ${p.promptKey} — differs from seed. Re-run with --force to bump to v${existing.version + 1}.`);
+    continue;
+  }
+
+  // Force: deactivate current, insert new version.
+  await db
+    .update(systemPrompts)
+    .set({ isActive: false })
+    .where(and(eq(systemPrompts.promptKey, p.promptKey), eq(systemPrompts.isActive, true)));
   await db.insert(systemPrompts).values({
     ...p,
-    version: 1,
+    version: existing.version + 1,
     isActive: true,
     createdBy,
   });
-  console.log(`[seed-prompts] ${p.promptKey} — seeded v1.`);
+  console.log(`[seed-prompts] ${p.promptKey} — force-updated to v${existing.version + 1}.`);
 }
 
 process.exit(0);

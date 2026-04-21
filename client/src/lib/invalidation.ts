@@ -19,3 +19,7 @@ export function invalidateStatements(qc: QueryClient) {
 export function invalidatePrompts(qc: QueryClient) {
   qc.invalidateQueries({ queryKey: ["/api/admin/prompts"] });
 }
+
+export function invalidateConversation(qc: QueryClient) {
+  qc.invalidateQueries({ queryKey: ["/api/qa/conversation"] });
+}

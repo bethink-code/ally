@@ -33,7 +33,7 @@ export default function Admin() {
       <header className="border-b border-border px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Link href="/" className="font-serif text-2xl">
-            Kin
+            Ally
           </Link>
           <span className="text-sm text-muted-foreground">/ Admin</span>
         </div>

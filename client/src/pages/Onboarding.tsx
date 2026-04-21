@@ -157,12 +157,28 @@ function PhotoStep({
       )}
 
       <div className="flex flex-col items-center gap-2">
-        <Button onClick={() => inputRef.current?.click()} disabled={working}>
-          {working ? "Resizing…" : hasPhoto ? "Pick a different photo" : "Upload a photo"}
-        </Button>
-        <Button variant="ghost" size="sm" onClick={onContinue}>
-          {hasPhoto ? "Continue" : "Skip for now"}
-        </Button>
+        {hasPhoto ? (
+          <>
+            <Button onClick={onContinue}>Continue</Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => inputRef.current?.click()}
+              disabled={working}
+            >
+              {working ? "Resizing…" : "Pick a different photo"}
+            </Button>
+          </>
+        ) : (
+          <>
+            <Button onClick={() => inputRef.current?.click()} disabled={working}>
+              {working ? "Resizing…" : "Upload a photo"}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={onContinue}>
+              Skip for now
+            </Button>
+          </>
+        )}
       </div>
     </div>
   );

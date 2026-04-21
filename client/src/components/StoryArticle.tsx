@@ -1,12 +1,7 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
 import { formatMoney, formatPercent } from "@/lib/formatters";
-import { StoryRotator } from "@/components/StoryRotator";
-import { useAuth } from "@/hooks/useAuth";
-import type { Analysis } from "@shared/schema";
 
-type AnalysisResult = {
+export type StoryAnalysisResult = {
   lifeSnapshot: string;
   income: {
     summary: string;
@@ -29,88 +24,18 @@ type AnalysisResult = {
   notes?: string;
 };
 
-export function AnalysisView({ onGoBack }: { onGoBack?: () => void }) {
-  const { user } = useAuth();
-  const firstName = user?.firstName ?? user?.email.split("@")[0] ?? "";
-  const q = useQuery<Analysis | null>({ queryKey: ["/api/analysis/latest"] });
-  const run = useMutation({
-    mutationFn: () => apiRequest("POST", "/api/analysis/run"),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/analysis/latest"] }),
-  });
-
-  if (q.isLoading) return null;
-
-  const latest = q.data;
-  const hasDoneResult = latest?.status === "done" && latest.result;
-
-  // If a previous analysis is done, always show it (even if the user is re-running).
-  if (hasDoneResult) {
-    const result = latest!.result as AnalysisResult;
-    return (
-      <AnalysisContent
-        result={result}
-        onRerun={() => run.mutate()}
-        rerunning={run.isPending}
-        onGoBack={onGoBack}
-      />
-    );
-  }
-
-  // Analysing in progress (either via mutation, or a prior server-side run that hasn't finished).
-  if (latest?.status === "analysing" || run.isPending) {
-    return (
-      <div className="flex flex-col items-center justify-center space-y-6 text-center py-8">
-        <div>
-          <h2 className="font-serif text-4xl">
-            {firstName ? `Reading your year, ${firstName}…` : "Reading across everything you've shared…"}
-          </h2>
-          <p className="mt-3 text-muted-foreground">This takes a minute.</p>
-        </div>
-        <div className="w-full max-w-2xl pt-4">
-          <StoryRotator label="While I read · a short story" />
-        </div>
-      </div>
-    );
-  }
-
-  // No analysis yet, or last attempt failed.
-  const hasFailure = latest?.status === "failed";
-  return (
-    <div className="flex flex-col items-center justify-center space-y-6 text-center py-8">
-      <div>
-        <h2 className="font-serif text-4xl">
-          {firstName ? `${firstName}, let me look at what you've shared.` : "Let me look at what you've shared."}
-        </h2>
-        <p className="mt-3 text-muted-foreground max-w-md mx-auto">
-          I'll read across all your statements and write back with the patterns I can see — and the things I can't.
-        </p>
-      </div>
-      {hasFailure && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm">
-          Last attempt failed: {latest!.errorMessage ?? "unknown error"}
-        </div>
-      )}
-      <div className="flex flex-col items-center gap-2">
-        <Button onClick={() => run.mutate()}>Look at my picture</Button>
-        {onGoBack && (
-          <Button variant="ghost" size="sm" onClick={onGoBack}>
-            Go back and add more
-          </Button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function AnalysisContent({
+// The Story — a narrative, editorial rendering of the analysis result.
+// Pure presentational: no data loading, no mutations, no chat wiring.
+// Ally's chat lives in the right pane of the two-pane layout, so there's no CTA to open a drawer.
+export function StoryArticle({
   result,
   onRerun,
   rerunning,
   onGoBack,
 }: {
-  result: AnalysisResult;
-  onRerun: () => void;
-  rerunning: boolean;
+  result: StoryAnalysisResult;
+  onRerun?: () => void;
+  rerunning?: boolean;
   onGoBack?: () => void;
 }) {
   return (
@@ -214,9 +139,6 @@ function AnalysisContent({
             </div>
           ))}
         </div>
-        <div className="pt-6">
-          <Button disabled>Let's fill these in (coming soon)</Button>
-        </div>
       </Section>
 
       {result.notes && (
@@ -225,16 +147,20 @@ function AnalysisContent({
         </div>
       )}
 
-      <div className="pt-8 border-t border-border flex justify-between items-center">
-        {onGoBack ? (
-          <Button variant="ghost" size="sm" onClick={onGoBack}>
-            Go back and add more
-          </Button>
-        ) : <span />}
-        <Button variant="ghost" size="sm" onClick={onRerun} disabled={rerunning}>
-          {rerunning ? "Reading again…" : "Run the analysis again"}
-        </Button>
-      </div>
+      {(onRerun || onGoBack) && (
+        <div className="pt-8 border-t border-border flex justify-between items-center">
+          {onGoBack ? (
+            <Button variant="ghost" size="sm" onClick={onGoBack}>
+              Go back and add more
+            </Button>
+          ) : <span />}
+          {onRerun && (
+            <Button variant="ghost" size="sm" onClick={onRerun} disabled={rerunning}>
+              {rerunning ? "Reading again…" : "Run the analysis again"}
+            </Button>
+          )}
+        </div>
+      )}
     </article>
   );
 }
