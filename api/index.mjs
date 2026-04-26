@@ -1124,7 +1124,7 @@ var router5 = Router5();
 router5.use(isAuthenticated);
 router5.get("/api/analysis/latest", async (req, res) => {
   const user = req.user;
-  const [row] = await db.select().from(analyses).where(eq7(analyses.userId, user.id)).orderBy(desc5(analyses.createdAt)).limit(1);
+  const [row] = await db.select().from(analyses).where(and4(eq7(analyses.userId, user.id), eq7(analyses.status, "done"))).orderBy(desc5(analyses.createdAt)).limit(1);
   res.json(row ?? null);
 });
 router5.post("/api/analysis/run", async (req, res) => {

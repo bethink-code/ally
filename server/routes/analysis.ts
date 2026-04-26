@@ -12,10 +12,13 @@ router.use(isAuthenticated);
 
 router.get("/api/analysis/latest", async (req, res) => {
   const user = req.user as { id: string };
+  // Only return analyses that have actually finished — otherwise an
+  // in-progress / failed row with no `result` masks the previous good one
+  // and downstream UI gets stuck on "Loading your picture…".
   const [row] = await db
     .select()
     .from(analyses)
-    .where(eq(analyses.userId, user.id))
+    .where(and(eq(analyses.userId, user.id), eq(analyses.status, "done")))
     .orderBy(desc(analyses.createdAt))
     .limit(1);
   res.json(row ?? null);
