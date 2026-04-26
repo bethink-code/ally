@@ -13,20 +13,20 @@ import type { SubStep } from "@shared/schema";
 // The server's background worker drives status transitions; this screen just
 // reflects the sub-step's errorMessage as the hit_problem sub-mode.
 //
-// Peek mode: when the user navigates here via the canvas pill while their
-// actual sub-step is past the analyse beat, render a static historical
-// recap instead — never lie that work is in flight.
+// Peek mode: when the user navigates here while sub-step is elsewhere,
+// render the static historical recap (AnalysePeek) — never lie that work
+// is in flight.
 export function AnalysisAnalyse({
   subStep,
-  onPeekDone,
+  peek,
+  onBackToCurrent,
 }: {
   subStep: SubStep;
-  onPeekDone?: () => void;
+  peek?: boolean;
+  onBackToCurrent?: () => void;
 }) {
   const { user } = useAuth();
   const displayName = user?.firstName ?? user?.email?.split("@")[0] ?? "You";
-
-  const isPeek = subStep.canvasKey !== "analysis" || subStep.beat !== "analyse";
 
   const retry = useMutation({
     mutationFn: () => apiRequest("POST", `/api/sub-step/${subStep.id}/retry`),
@@ -60,8 +60,8 @@ export function AnalysisAnalyse({
         statusLine={<span className="text-muted-foreground">{BEAT_STATUS_LINE.analysis.analyse}</span>}
       />
       <div className="flex-1 min-h-0 overflow-auto shadow-[inset_0_0_0_4px_var(--color-muted)]">
-        {isPeek ? (
-          <AnalysePeek canvas="analysis" onSeeResult={onPeekDone} />
+        {peek ? (
+          <AnalysePeek canvas="analysis" onSeeResult={onBackToCurrent} />
         ) : (
           <AllyAtWork
             mode={mode}
@@ -73,7 +73,13 @@ export function AnalysisAnalyse({
           />
         )}
       </div>
-      <PhaseActionBar />
+      <PhaseActionBar
+        primary={
+          peek
+            ? { label: "Back to current →", onClick: onBackToCurrent ?? (() => {}) }
+            : undefined
+        }
+      />
     </div>
   );
 }

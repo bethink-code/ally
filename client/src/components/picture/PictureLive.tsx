@@ -13,7 +13,19 @@ import type { Analysis, SubStep } from "@shared/schema";
 // back to Discuss via the Reopen action. The primary forward CTA jumps to the
 // next canvas (analysis) — Canvas 2 is auto-started on agree, so it always
 // exists by the time this screen renders.
-export function PictureLive({ subStep, onContinue }: { subStep: SubStep; onContinue?: () => void }) {
+export function PictureLive({
+  subStep,
+  onContinue,
+  peek,
+  onBackToCurrent,
+}: {
+  subStep: SubStep;
+  onContinue?: () => void;
+  /** Rendered as a peek (sub-step is elsewhere). Disables the reopen flow
+   *  and replaces the primary CTA with "Back to current". */
+  peek?: boolean;
+  onBackToCurrent?: () => void;
+}) {
   const { user } = useAuth();
   const displayName = user?.firstName ?? user?.email?.split("@")[0] ?? "You";
 
@@ -80,18 +92,21 @@ export function PictureLive({ subStep, onContinue }: { subStep: SubStep; onConti
 
       <PhaseActionBar
         primary={
-          onContinue
-            ? {
-                label: "See your analysis →",
-                onClick: onContinue,
-              }
-            : undefined
+          peek
+            ? { label: "Back to current →", onClick: onBackToCurrent ?? (() => {}) }
+            : onContinue
+              ? { label: "See your analysis →", onClick: onContinue }
+              : undefined
         }
-        secondary={{
-          label: reopen.isPending ? "Reopening…" : "Something's not right",
-          onClick: () => reopen.mutate(),
-          disabled: reopen.isPending,
-        }}
+        secondary={
+          peek
+            ? undefined
+            : {
+                label: reopen.isPending ? "Reopening…" : "Something's not right",
+                onClick: () => reopen.mutate(),
+                disabled: reopen.isPending,
+              }
+        }
       />
     </div>
   );

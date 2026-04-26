@@ -173,8 +173,11 @@ function PillTrigger({
             draft,
             subStep,
           });
-          const clickable =
-            !!onNavigateSubStep && (relation === "past" || relation === "current");
+          // Permissive: every beat in the inline pill timeline is clickable
+          // — past/current go through landing → transition → content; future
+          // go through landing → "Back to current" (no transition). Single
+          // rule via the new navigation module.
+          const clickable = !!onNavigateSubStep;
           const handleClick = clickable
             ? () => onNavigateSubStep?.(activeCanvas, beat)
             : undefined;
@@ -382,8 +385,8 @@ function Arc({
             onStageClick={handleStageClick}
           />
         )}
-        {viewingTab === "plan" && <PlanStages />}
-        {viewingTab === "progress" && <ProgressStages />}
+        {viewingTab === "plan" && <PlanStages onStageClick={handleStageClick} />}
+        {viewingTab === "progress" && <ProgressStages onStageClick={handleStageClick} />}
       </div>
       <HistoryFooter userCreatedAt={user?.createdAt} onClose={onClose} />
     </div>
@@ -406,9 +409,10 @@ function CanvasTabs({
         const state = states[k];
         const isCurrent = state === "current";
         const isPast = state === "past";
-        // Tabs are "peek" controls — past + current are clickable to view
-        // that canvas's stages inside the modal. No navigation happens here.
-        const interactive = isCurrent || isPast;
+        // All tabs interactive — peek any canvas inside the modal. Stage
+        // cards are the navigation surface; tabs only switch the in-modal
+        // view. Permissive: don't gate by progress state.
+        const interactive = true;
 
         const content = (
           <>
@@ -562,7 +566,9 @@ function PictureStages({
 
           const meta = BEAT_LABEL.picture[beat];
           const status = pictureBeatStatus(beat, relation, extractedCount, analysisDone);
-          const clickable = relation === "past" || relation === "current";
+          // Permissive: every beat clickable — Dashboard's landing/transition
+          // flow handles past/current/future variants.
+          const clickable = !!onStageClick;
           const handleClick =
             clickable && onStageClick ? () => onStageClick("picture", beat) : undefined;
 
@@ -714,7 +720,7 @@ function AnalysisStages({
           const title = meta.title || "Pulled in";
           const description = meta.description || "Ally pulls in your agreed picture and gets to work.";
           const status = analysisBeatStatus(beat, relation, draft);
-          const clickable = relation === "past" || relation === "current";
+          const clickable = !!onStageClick;
           const handleClick =
             clickable && onStageClick ? () => onStageClick("analysis", beat) : undefined;
 
@@ -763,10 +769,14 @@ function analysisBeatStatus(
   return relation === "next" ? "Pending your sign-off" : "—";
 }
 
-// Placeholder stages for canvases that aren't built yet. Visible so the
-// megamenu feels complete; cards are inert (no onStageClick) until the
-// canvas is implemented. Copy reflects the architectural intent.
-function PlanStages() {
+// Placeholder stages for canvases not yet built. Cards clickable — clicks
+// route through the BeatLanding "Coming up" path which dismisses with
+// "Back to current" (no transition into non-existent content).
+function PlanStages({
+  onStageClick,
+}: {
+  onStageClick?: (canvas: CanvasKey, subStep: string) => void;
+}) {
   return (
     <div className="space-y-2">
       <SectionLabel>The four beats of your plan</SectionLabel>
@@ -775,6 +785,7 @@ function PlanStages() {
           const meta = BEAT_LABEL.plan[beat];
           const title = meta.title || (beat === "gather" ? "Pulled in" : beat);
           const description = meta.description || "Pulls in your agreed analysis.";
+          const handleClick = onStageClick ? () => onStageClick("plan", beat) : undefined;
           return (
             <StageCard
               key={beat}
@@ -783,6 +794,7 @@ function PlanStages() {
               description={description}
               status={beat === "live" ? "Pending your sign-off" : "Opens after analysis is agreed"}
               relation="future"
+              onClick={handleClick}
             />
           );
         })}
@@ -794,7 +806,11 @@ function PlanStages() {
   );
 }
 
-function ProgressStages() {
+function ProgressStages({
+  onStageClick,
+}: {
+  onStageClick?: (canvas: CanvasKey, subStep: string) => void;
+}) {
   return (
     <div className="space-y-2">
       <SectionLabel>The four beats of your progress</SectionLabel>
@@ -803,6 +819,7 @@ function ProgressStages() {
           const meta = BEAT_LABEL.progress[beat];
           const title = meta.title || beat;
           const description = meta.description || "—";
+          const handleClick = onStageClick ? () => onStageClick("progress", beat) : undefined;
           return (
             <StageCard
               key={beat}
@@ -811,6 +828,7 @@ function ProgressStages() {
               description={description}
               status="Wakes up once you have a plan in motion"
               relation="future"
+              onClick={handleClick}
             />
           );
         })}

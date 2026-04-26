@@ -12,7 +12,19 @@ import type { Analysis, SubStep } from "@shared/schema";
 // Canvas 1, Discuss beat. The story-plus-chat sub-step. Person reads the first
 // take, chats with Ally to correct and fill gaps, then Agrees when ready —
 // click opens the agreement gate, which checks coverage + skips before locking.
-export function PictureDiscuss({ subStep }: { subStep: SubStep }) {
+//
+// Peek mode: read-only — story still renders (it's just the agreed picture
+// being read after the fact); the Agree CTA disappears, foot bar primary
+// becomes "Back to current".
+export function PictureDiscuss({
+  subStep,
+  peek,
+  onBackToCurrent,
+}: {
+  subStep: SubStep;
+  peek?: boolean;
+  onBackToCurrent?: () => void;
+}) {
   const { user } = useAuth();
   const displayName = user?.firstName ?? user?.email?.split("@")[0] ?? "You";
   const [gateOpen, setGateOpen] = useState(false);
@@ -68,20 +80,26 @@ export function PictureDiscuss({ subStep }: { subStep: SubStep }) {
       </div>
 
       <PhaseActionBar
-        primary={{
-          label: "This is my picture",
-          onClick: () => setGateOpen(true),
-          disabled: !storyResult,
-        }}
+        primary={
+          peek
+            ? { label: "Back to current →", onClick: onBackToCurrent ?? (() => {}) }
+            : {
+                label: "This is my picture",
+                onClick: () => setGateOpen(true),
+                disabled: !storyResult,
+              }
+        }
       />
 
-      <AgreementGate
-        subStepId={subStep.id}
-        open={gateOpen}
-        onClose={() => setGateOpen(false)}
-        onAgreed={() => setGateOpen(false)}
-        lockLabel="Lock it in"
-      />
+      {!peek && (
+        <AgreementGate
+          subStepId={subStep.id}
+          open={gateOpen}
+          onClose={() => setGateOpen(false)}
+          onAgreed={() => setGateOpen(false)}
+          lockLabel="Lock it in"
+        />
+      )}
     </div>
   );
 }

@@ -10,27 +10,21 @@ import { BEAT_LABEL, BEAT_STATUS_LINE } from "@/lib/canvasCopy";
 import type { SubStep } from "@shared/schema";
 
 // Canvas 1, Analyse beat. Renders AllyAtWork while the server's background
-// worker produces the first-take analysis. Sub-step status transitions (working
-// → taking_longer → hit_problem → recovered) are driven by the server and
-// surfaced here by polling /api/sub-step/current.
+// worker produces the first-take analysis.
 //
-// Peek mode: when the user navigates here via the canvas pill while their
-// actual sub-step is past the analyse beat, render a static historical
-// recap instead — never lie that work is in flight.
+// Peek mode: when navigated here while sub-step is elsewhere, render the
+// static historical recap (AnalysePeek) — never lie that work is in flight.
 export function PictureAnalyse({
   subStep,
-  onPeekDone,
+  peek,
+  onBackToCurrent,
 }: {
   subStep: SubStep;
-  onPeekDone?: () => void;
+  peek?: boolean;
+  onBackToCurrent?: () => void;
 }) {
   const { user } = useAuth();
   const displayName = user?.firstName ?? user?.email?.split("@")[0] ?? "You";
-
-  // Peek detection: this component is rendered when effectiveBeat=analyse,
-  // but the user's real sub-step may be elsewhere (live, or even on a
-  // different canvas). Either case = peek.
-  const isPeek = subStep.canvasKey !== "picture" || subStep.beat !== "analyse";
 
   const retry = useMutation({
     mutationFn: () => apiRequest("POST", `/api/sub-step/${subStep.id}/retry`),
@@ -64,8 +58,8 @@ export function PictureAnalyse({
         statusLine={<span className="text-muted-foreground">{BEAT_STATUS_LINE.picture.analyse}</span>}
       />
       <div className="flex-1 min-h-0 overflow-auto shadow-[inset_0_0_0_4px_var(--color-muted)]">
-        {isPeek ? (
-          <AnalysePeek canvas="picture" onSeeResult={onPeekDone} />
+        {peek ? (
+          <AnalysePeek canvas="picture" onSeeResult={onBackToCurrent} />
         ) : (
           <AllyAtWork
             mode={mode}
@@ -77,7 +71,13 @@ export function PictureAnalyse({
           />
         )}
       </div>
-      <PhaseActionBar />
+      <PhaseActionBar
+        primary={
+          peek
+            ? { label: "Back to current →", onClick: onBackToCurrent ?? (() => {}) }
+            : undefined
+        }
+      />
     </div>
   );
 }

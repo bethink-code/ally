@@ -12,7 +12,18 @@ import { AnalysisPanels } from "./AnalysisPanels";
 import { FormatToggle, useFormatPreference } from "./FormatToggle";
 
 // Canvas 2, Live beat. The agreed analysis, read-only, dated.
-export function AnalysisLive({ subStep }: { subStep: SubStep }) {
+//
+// Peek mode: same content (already read-only); foot bar primary becomes
+// "Back to current", reopen secondary disabled.
+export function AnalysisLive({
+  subStep,
+  peek,
+  onBackToCurrent,
+}: {
+  subStep: SubStep;
+  peek?: boolean;
+  onBackToCurrent?: () => void;
+}) {
   const { user } = useAuth();
   const displayName = user?.firstName ?? user?.email?.split("@")[0] ?? "You";
 
@@ -90,11 +101,20 @@ export function AnalysisLive({ subStep }: { subStep: SubStep }) {
       </div>
 
       <PhaseActionBar
-        secondary={{
-          label: reopen.isPending ? "Reopening…" : "Something's not right",
-          onClick: () => reopen.mutate(),
-          disabled: reopen.isPending,
-        }}
+        primary={
+          peek
+            ? { label: "Back to current →", onClick: onBackToCurrent ?? (() => {}) }
+            : undefined
+        }
+        secondary={
+          peek
+            ? undefined
+            : {
+                label: reopen.isPending ? "Reopening…" : "Something's not right",
+                onClick: () => reopen.mutate(),
+                disabled: reopen.isPending,
+              }
+        }
       />
     </div>
   );

@@ -12,7 +12,19 @@ import type { Statement, SubStep } from "@shared/schema";
 
 // Canvas 1, Gather beat. Refactor of the previous BringItIn — same upload body,
 // but advancement is now driven by the sub-step orchestrator.
-export function PictureGather({ subStep }: { subStep: SubStep }) {
+//
+// Peek mode: read-only — the upload zone disappears, the statement list stays
+// (so the user can see what's on record), and the foot bar offers only
+// "Back to current".
+export function PictureGather({
+  subStep,
+  peek,
+  onBackToCurrent,
+}: {
+  subStep: SubStep;
+  peek?: boolean;
+  onBackToCurrent?: () => void;
+}) {
   const { user } = useAuth();
   const queueState = useStatementQueue();
   const statementsQ = useQuery<Statement[]>({ queryKey: ["/api/statements"] });
@@ -53,22 +65,28 @@ export function PictureGather({ subStep }: { subStep: SubStep }) {
         statusLine={<span className="text-muted-foreground">{BEAT_STATUS_LINE.picture.gather}</span>}
       />
       <main className="flex-1 overflow-y-auto px-6 py-8 min-h-0 space-y-8 shadow-[inset_0_0_0_4px_var(--color-muted)]">
-        <StatementUpload
-          queue={queueState.queue}
-          anyBusy={queueState.anyBusy}
-          rejectWarning={queueState.rejectWarning}
-          onStageFiles={queueState.stageFiles}
-          onClearFinished={queueState.clearFinished}
-        />
+        {!peek && (
+          <StatementUpload
+            queue={queueState.queue}
+            anyBusy={queueState.anyBusy}
+            rejectWarning={queueState.rejectWarning}
+            onStageFiles={queueState.stageFiles}
+            onClearFinished={queueState.clearFinished}
+          />
+        )}
         <StatementList statements={statements} />
       </main>
 
       <PhaseActionBar
-        primary={{
-          label: advance.isPending ? "One moment…" : "That's all my docs",
-          onClick: () => advance.mutate(),
-          disabled: !canAdvance || advance.isPending,
-        }}
+        primary={
+          peek
+            ? { label: "Back to current →", onClick: onBackToCurrent ?? (() => {}) }
+            : {
+                label: advance.isPending ? "One moment…" : "That's all my docs",
+                onClick: () => advance.mutate(),
+                disabled: !canAdvance || advance.isPending,
+              }
+        }
       />
     </div>
   );

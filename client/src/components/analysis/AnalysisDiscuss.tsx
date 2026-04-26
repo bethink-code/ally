@@ -14,7 +14,18 @@ import { FormatToggle, useFormatPreference } from "./FormatToggle";
 // Canvas 2, Discuss beat. The first-draft analysis is visible. Person reads,
 // refines with Ally in chat, then Agrees when it lands — click opens the
 // agreement gate, which checks coverage + skips before locking.
-export function AnalysisDiscuss({ subStep }: { subStep: SubStep }) {
+//
+// Peek mode: draft renders read-only (no Agree). Foot bar primary becomes
+// "Back to current".
+export function AnalysisDiscuss({
+  subStep,
+  peek,
+  onBackToCurrent,
+}: {
+  subStep: SubStep;
+  peek?: boolean;
+  onBackToCurrent?: () => void;
+}) {
   const { user } = useAuth();
   const displayName = user?.firstName ?? user?.email?.split("@")[0] ?? "You";
   const [gateOpen, setGateOpen] = useState(false);
@@ -77,20 +88,26 @@ export function AnalysisDiscuss({ subStep }: { subStep: SubStep }) {
       </div>
 
       <PhaseActionBar
-        primary={{
-          label: "This is me",
-          onClick: () => setGateOpen(true),
-          disabled: !draft,
-        }}
+        primary={
+          peek
+            ? { label: "Back to current →", onClick: onBackToCurrent ?? (() => {}) }
+            : {
+                label: "This is me",
+                onClick: () => setGateOpen(true),
+                disabled: !draft,
+              }
+        }
       />
 
-      <AgreementGate
-        subStepId={subStep.id}
-        open={gateOpen}
-        onClose={() => setGateOpen(false)}
-        onAgreed={() => setGateOpen(false)}
-        lockLabel="Lock it in"
-      />
+      {!peek && (
+        <AgreementGate
+          subStepId={subStep.id}
+          open={gateOpen}
+          onClose={() => setGateOpen(false)}
+          onAgreed={() => setGateOpen(false)}
+          lockLabel="Lock it in"
+        />
+      )}
     </div>
   );
 }
