@@ -194,7 +194,12 @@ export const analysisClaims = pgTable(
   "analysis_claims",
   {
     id: serial("id").primaryKey(),
-    draftId: integer("draft_id").notNull().references(() => analysisDrafts.id),
+    // Polymorphic ownership: a claim belongs to either a Canvas 2 draft OR
+    // a Canvas 1 analysis. App-level invariant: exactly one of (draftId,
+    // analysisId) is non-null. Keeping both nullable avoids forcing Drizzle
+    // through a CHECK constraint migration.
+    draftId: integer("draft_id").references(() => analysisDrafts.id),
+    analysisId: integer("analysis_id").references(() => analyses.id),
     kind: text("kind").notNull(), // explain | note
     anchorId: text("anchor_id").notNull(), // structural id referenced from prose/panels
     label: text("label").notNull(), // the phrase highlighted in the draft
@@ -202,7 +207,10 @@ export const analysisClaims = pgTable(
     body: text("body"), // claim restatement or note body
     evidenceRefs: jsonb("evidence_refs"), // {transactions:[], months:[], profilePaths:[], ...}
   },
-  (t) => [index("idx_analysis_claims_draft_id").on(t.draftId)]
+  (t) => [
+    index("idx_analysis_claims_draft_id").on(t.draftId),
+    index("idx_analysis_claims_analysis_id").on(t.analysisId),
+  ]
 );
 
 // The refining conversation that happens alongside the draft. Separate from the

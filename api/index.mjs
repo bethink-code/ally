@@ -233,7 +233,12 @@ var analysisClaims = pgTable(
   "analysis_claims",
   {
     id: serial("id").primaryKey(),
-    draftId: integer("draft_id").notNull().references(() => analysisDrafts.id),
+    // Polymorphic ownership: a claim belongs to either a Canvas 2 draft OR
+    // a Canvas 1 analysis. App-level invariant: exactly one of (draftId,
+    // analysisId) is non-null. Keeping both nullable avoids forcing Drizzle
+    // through a CHECK constraint migration.
+    draftId: integer("draft_id").references(() => analysisDrafts.id),
+    analysisId: integer("analysis_id").references(() => analyses.id),
     kind: text("kind").notNull(),
     // explain | note
     anchorId: text("anchor_id").notNull(),
@@ -247,7 +252,10 @@ var analysisClaims = pgTable(
     evidenceRefs: jsonb("evidence_refs")
     // {transactions:[], months:[], profilePaths:[], ...}
   },
-  (t) => [index("idx_analysis_claims_draft_id").on(t.draftId)]
+  (t) => [
+    index("idx_analysis_claims_draft_id").on(t.draftId),
+    index("idx_analysis_claims_analysis_id").on(t.analysisId)
+  ]
 );
 var analysisConversations = pgTable(
   "analysis_conversations",
@@ -1033,7 +1041,7 @@ var prompts_default = router4;
 
 // server/routes/analysis.ts
 import { Router as Router5 } from "express";
-import { and as and4, desc as desc5, eq as eq7 } from "drizzle-orm";
+import { and as and4, desc as desc5, eq as eq7, isNull } from "drizzle-orm";
 
 // server/modules/analysis/analyse.ts
 import Anthropic2 from "@anthropic-ai/sdk";
@@ -1064,33 +1072,59 @@ var gapSchema = z4.object({
   whyItMatters: z4.string().describe("One or two sentences in plain language explaining why this gap is worth closing"),
   questionToAsk: z4.string().describe("The specific conversational question to ask the user next, warm and curious, not interrogative")
 });
+var annotationSchema = z4.object({
+  kind: z4.literal("explain"),
+  phrase: z4.string().describe("The exact phrase from the surrounding text that becomes clickable. Must appear verbatim in the text."),
+  anchorId: z4.string().describe("A short stable id for this anchor \u2014 e.g. 'income-pattern', 'monthly-average', 'spending-shape'. Used to look up the matching explainClaim.")
+});
+var explainClaimSchema = z4.object({
+  anchorId: z4.string().describe("Matches an annotation's anchorId."),
+  label: z4.string().describe("The phrase being explained, restated."),
+  body: z4.string().describe("The explanation in 1-3 sentences. The 'why' or 'how' behind the headline phrase. Warm, plain-language."),
+  evidenceRefs: z4.array(z4.object({
+    kind: z4.string().describe("e.g. 'transactions', 'months', 'category'"),
+    ref: z4.string().describe("Specific reference \u2014 date range, merchant, etc.")
+  })).default([]),
+  chartKind: z4.enum([
+    "none",
+    "balance_by_month",
+    "spend_by_category",
+    "income_over_time",
+    "cash_flow_shape"
+  ]).default("none").describe("If a small evidence chart helps, the kind. Default 'none'.")
+});
 var analysisSchema = z4.object({
   lifeSnapshot: z4.string().describe("A warm 2-3 sentence paragraph describing this person's financial life based on what the statements show. Observational and human \u2014 'Your money comes in once a month. Most of it goes out again within a fortnight.'"),
+  lifeSnapshotAnnotations: z4.array(annotationSchema).default([]).describe("Phrases in lifeSnapshot worth making clickable for inline explanation. 0-3 items."),
   income: z4.object({
     summary: z4.string().describe("Short narrative describing income \u2014 regularity, sources, variability. Plain language, warm, not clinical."),
+    summaryAnnotations: z4.array(annotationSchema).default([]).describe("Phrases in summary worth making clickable. 0-3 items."),
     monthlyAverage: z4.number().nullable().describe("Average monthly income across the period, ZAR"),
     regularity: z4.enum(["steady", "variable", "irregular"]),
     sources: z4.array(incomeSourceSchema)
   }),
   spending: z4.object({
     summary: z4.string().describe("Short narrative describing the shape of spending \u2014 calm, non-judgemental."),
+    summaryAnnotations: z4.array(annotationSchema).default([]).describe("Phrases in summary worth making clickable. 0-3 items."),
     monthlyAverage: z4.number().nullable(),
     byCategory: z4.array(categorySchema).describe("Categories sorted by monthlyAverage descending")
   }),
   savings: z4.object({
     summary: z4.string().describe("A single observation about savings behaviour \u2014 what's happening or what isn't. No lecturing."),
+    summaryAnnotations: z4.array(annotationSchema).default([]).describe("Phrases in summary worth making clickable. 0-3 items."),
     monthlyAverageSaved: z4.number().nullable().describe("Can be negative if outflows exceed inflows. Null if unclear."),
     observation: z4.string().describe("One sentence \u2014 plain, honest, hopeful.")
   }),
   recurring: z4.array(recurringSchema).describe("Debit orders / subscriptions / regular outflows detected"),
   gaps: z4.array(gapSchema).describe("What the statements cannot show but we need to understand the full picture. Typical gaps: retirement, insurance, crypto, undisclosed debt, employer benefits, goals, concerns. Prioritise the 5-8 most important."),
+  explainClaims: z4.array(explainClaimSchema).default([]).describe("Every annotation across the document must have a matching explainClaim with the same anchorId. The body is what's shown when the user clicks the phrase."),
   notes: z4.string().optional().describe("Anything else worth flagging \u2014 unusual patterns, data quality caveats, etc.")
 });
 
 // server/modules/analysis/analyse.ts
 var client2 = new Anthropic2();
 async function analyseStatements(input) {
-  const body = buildUserMessage(input.statements);
+  const body = buildUserMessage(input.statements, input.conversationProfile, input.flaggedIssues);
   const response = await client2.messages.parse({
     model: input.model,
     // Lowered from 16000 — observed outputs are ~3.5k tokens. The high
@@ -1124,7 +1158,7 @@ async function analyseStatements(input) {
     }
   };
 }
-function buildUserMessage(statements2) {
+function buildUserMessage(statements2, profile, flaggedIssues) {
   const header = `You are being given ${statements2.length} extracted bank statements covering a period of months. Analyse the whole set together, not one at a time.
 
 `;
@@ -1132,7 +1166,27 @@ function buildUserMessage(statements2) {
 \`\`\`json
 ${JSON.stringify(s.extraction)}
 \`\`\``).join("\n\n");
-  return header + body;
+  const profileObj = profile ?? {};
+  const hasProfile = profileObj && Object.keys(profileObj).some((k) => {
+    const v = profileObj[k];
+    if (typeof v === "string") return v.trim().length > 0;
+    if (Array.isArray(v)) return v.length > 0;
+    return v != null;
+  });
+  const flagsArr = Array.isArray(flaggedIssues) ? flaggedIssues : [];
+  if (!hasProfile && flagsArr.length === 0) return header + body;
+  const tail = ["", "## What the user has told us so far (incorporate this)"];
+  if (hasProfile) {
+    tail.push("```json", JSON.stringify(profileObj), "```");
+  }
+  if (flagsArr.length > 0) {
+    tail.push("", "Flagged issues:", ...flagsArr.map((f) => `- ${f}`));
+  }
+  tail.push(
+    "",
+    "Treat these as authoritative corrections / context. They override any default reading of the raw transactions."
+  );
+  return header + body + "\n\n" + tail.join("\n");
 }
 
 // server/routes/analysis.ts
@@ -1142,6 +1196,15 @@ router5.get("/api/analysis/latest", async (req, res) => {
   const user = req.user;
   const [row] = await db.select().from(analyses).where(and4(eq7(analyses.userId, user.id), eq7(analyses.status, "done"))).orderBy(desc5(analyses.createdAt)).limit(1);
   res.json(row ?? null);
+});
+router5.get("/api/analysis/:id/claims", async (req, res) => {
+  const user = req.user;
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
+  const [row] = await db.select().from(analyses).where(and4(eq7(analyses.id, id), eq7(analyses.userId, user.id))).limit(1);
+  if (!row) return res.status(404).json({ error: "not_found" });
+  const claims = await db.select().from(analysisClaims).where(eq7(analysisClaims.analysisId, id));
+  res.json(claims);
 });
 router5.post("/api/analysis/run", async (req, res) => {
   const user = req.user;
@@ -1196,6 +1259,75 @@ router5.post("/api/analysis/run", async (req, res) => {
     });
     res.status(500).json({ error: "analysis_failed", message });
   }
+});
+router5.post("/api/analysis/refresh", async (req, res) => {
+  const user = req.user;
+  const sts = await db.select().from(statements).where(and4(eq7(statements.userId, user.id), eq7(statements.status, "extracted")));
+  if (sts.length === 0) return res.status(400).json({ error: "no_statements" });
+  const prompt = await getActivePrompt("analysis");
+  if (!prompt) return res.status(500).json({ error: "no_active_analysis_prompt" });
+  const [conv] = await db.select().from(conversations).where(eq7(conversations.userId, user.id)).limit(1);
+  const [created] = await db.insert(analyses).values({
+    userId: user.id,
+    status: "analysing",
+    promptVersionId: prompt.id,
+    sourceStatementIds: sts.map((s) => s.id)
+  }).returning();
+  audit({ req, action: "analysis.refresh_start", resourceType: "analysis", resourceId: String(created.id) });
+  res.json({ analysisId: created.id, status: "analysing" });
+  void (async () => {
+    try {
+      const { result, usage } = await analyseStatements({
+        systemPrompt: prompt.content,
+        model: prompt.model,
+        statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
+        conversationProfile: conv?.profile ?? null,
+        flaggedIssues: conv?.flaggedIssues ?? []
+      });
+      await db.update(analyses).set({
+        status: "done",
+        result,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens,
+        cacheCreationTokens: usage.cacheCreationTokens,
+        completedAt: /* @__PURE__ */ new Date()
+      }).where(eq7(analyses.id, created.id));
+      const r = result;
+      const claims = r.explainClaims ?? [];
+      if (claims.length > 0) {
+        const phraseByAnchor = /* @__PURE__ */ new Map();
+        for (const a of r.lifeSnapshotAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+        for (const a of r.income?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+        for (const a of r.spending?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+        for (const a of r.savings?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+        await db.insert(analysisClaims).values(
+          claims.map((c) => ({
+            analysisId: created.id,
+            kind: "explain",
+            anchorId: c.anchorId,
+            label: phraseByAnchor.get(c.anchorId) ?? c.label,
+            body: c.body,
+            evidenceRefs: { refs: c.evidenceRefs, chartKind: c.chartKind }
+          }))
+        );
+      }
+      await db.update(subSteps).set({
+        contentJson: { analysisId: created.id },
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(
+        and4(
+          eq7(subSteps.userId, user.id),
+          eq7(subSteps.canvasKey, "picture"),
+          isNull(subSteps.supersededAt)
+        )
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "unknown_error";
+      console.error("[analysis.refresh] failed:", err);
+      await db.update(analyses).set({ status: "failed", errorMessage: message, completedAt: /* @__PURE__ */ new Date() }).where(eq7(analyses.id, created.id));
+    }
+  })();
 });
 var analysis_default = router5;
 
@@ -1423,7 +1555,7 @@ function concatDedup(existing, incoming) {
 import { eq as eq11 } from "drizzle-orm";
 
 // server/modules/record/index.ts
-import { and as and5, asc, desc as desc6, eq as eq8, isNull, or } from "drizzle-orm";
+import { and as and5, asc, desc as desc6, eq as eq8, isNull as isNull2, or } from "drizzle-orm";
 async function ensureRecord(userId) {
   const [existing] = await db.select().from(record).where(eq8(record.userId, userId)).limit(1);
   if (existing) {
@@ -1478,7 +1610,7 @@ async function lazyBackfillFromLegacy(userId, recordId) {
       });
     }
   }
-  const [draft] = await db.select().from(analysisDrafts).where(and5(eq8(analysisDrafts.userId, userId), isNull(analysisDrafts.supersededAt))).orderBy(desc6(analysisDrafts.createdAt)).limit(1);
+  const [draft] = await db.select().from(analysisDrafts).where(and5(eq8(analysisDrafts.userId, userId), isNull2(analysisDrafts.supersededAt))).orderBy(desc6(analysisDrafts.createdAt)).limit(1);
   if (draft) {
     const claims = await db.select().from(analysisClaims).where(eq8(analysisClaims.draftId, draft.id));
     for (const c of claims) {
@@ -2325,7 +2457,7 @@ var qa_default = router6;
 
 // server/routes/analysisDraft.ts
 import { Router as Router7 } from "express";
-import { and as and10, desc as desc10, eq as eq14, isNull as isNull2 } from "drizzle-orm";
+import { and as and10, desc as desc10, eq as eq14, isNull as isNull3 } from "drizzle-orm";
 
 // server/modules/analysisDraft/claude.ts
 import Anthropic4 from "@anthropic-ai/sdk";
@@ -2416,14 +2548,14 @@ var analysisFactsSchema = z7.object({
     evidenceRefs: z7.array(evidenceRefSchema)
   })).describe("The facts that should become Notes / Record of Advice entries \u2014 dated, attributed, referenceable.")
 });
-var annotationSchema = z7.object({
+var annotationSchema2 = z7.object({
   kind: z7.enum(["explain", "note"]),
   phrase: z7.string().describe("The exact text substring from the surrounding copy to highlight. Must appear verbatim in the paragraph/anchor text."),
   anchorId: z7.string().describe("Stable id referencing a claim (explain) or note (note). Prose and panels MAY share anchor ids when they reference the same underlying fact.")
 });
 var proseParagraphSchema = z7.object({
   text: z7.string(),
-  annotations: z7.array(annotationSchema).default([])
+  annotations: z7.array(annotationSchema2).default([])
 });
 var proseSectionSchema = z7.object({
   id: z7.string().describe("Matches the facts section id."),
@@ -2471,7 +2603,7 @@ var panelBeatSchema = z7.object({
     "none"
   ]).describe("The visual metaphor to use. 'none' = copy-only beat (opener or beat of silence). Extend the enum only when a new metaphor is earned."),
   proportion: proportionSchema.optional().describe("Optional proportional visual (e.g., income vs commitments). Rendered deterministically."),
-  annotations: z7.array(annotationSchema).default([])
+  annotations: z7.array(annotationSchema2).default([])
 });
 var analysisPanelsSchema = z7.object({
   beats: z7.array(panelBeatSchema).describe("Ordered top-to-bottom. The first beat IS the opening recognition."),
@@ -2677,7 +2809,7 @@ function summariseStatements2(rows) {
   });
 }
 async function getCurrentDraft(userId) {
-  const [row] = await db.select().from(analysisDrafts).where(and10(eq14(analysisDrafts.userId, userId), isNull2(analysisDrafts.supersededAt))).orderBy(desc10(analysisDrafts.createdAt)).limit(1);
+  const [row] = await db.select().from(analysisDrafts).where(and10(eq14(analysisDrafts.userId, userId), isNull3(analysisDrafts.supersededAt))).orderBy(desc10(analysisDrafts.createdAt)).limit(1);
   return row ?? null;
 }
 router7.post("/api/analysis-draft/generate", async (req, res) => {
@@ -2843,6 +2975,80 @@ router7.post("/api/analysis-draft/:id/reopen", async (req, res) => {
     resourceId: String(id)
   });
   res.json({ ok: true });
+});
+router7.post("/api/analysis-draft/refresh", async (req, res) => {
+  const user = req.user;
+  const [c1Conversation] = await db.select().from(conversations).where(eq14(conversations.userId, user.id)).orderBy(desc10(conversations.updatedAt)).limit(1);
+  if (!c1Conversation) return res.status(400).json({ error: "no_conversation" });
+  const [c1Analysis] = await db.select().from(analyses).where(and10(eq14(analyses.userId, user.id), eq14(analyses.status, "done"))).orderBy(desc10(analyses.createdAt)).limit(1);
+  if (!c1Analysis) return res.status(400).json({ error: "no_analysis" });
+  const userStatements = await db.select().from(statements).where(eq14(statements.userId, user.id));
+  const [factsPrompt, prosePrompt, panelsPrompt] = await Promise.all([
+    getActivePrompt("analysis_facts"),
+    getActivePrompt("analysis_prose"),
+    getActivePrompt("analysis_panels")
+  ]);
+  if (!factsPrompt || !prosePrompt || !panelsPrompt) {
+    return res.status(500).json({ error: "no_active_prompts" });
+  }
+  await db.update(analysisDrafts).set({ status: "superseded", supersededAt: /* @__PURE__ */ new Date() }).where(
+    and10(
+      eq14(analysisDrafts.userId, user.id),
+      isNull3(analysisDrafts.supersededAt)
+    )
+  );
+  const [created] = await db.insert(analysisDrafts).values({
+    userId: user.id,
+    sourceConversationId: c1Conversation.id,
+    sourceAnalysisId: c1Analysis.id,
+    status: "thinking"
+  }).returning();
+  audit({ req, action: "analysis_draft.refresh.start", resourceType: "analysis_draft", resourceId: String(created.id) });
+  res.json({ draftId: created.id, status: "thinking" });
+  void (async () => {
+    try {
+      const out = await buildAnalysisDraft({
+        prompts: {
+          facts: { id: factsPrompt.id, content: factsPrompt.content, model: factsPrompt.model },
+          prose: { id: prosePrompt.id, content: prosePrompt.content, model: prosePrompt.model },
+          panels: { id: panelsPrompt.id, content: panelsPrompt.content, model: panelsPrompt.model }
+        },
+        firstTakeAnalysis: c1Analysis.result,
+        conversationProfile: c1Conversation.profile,
+        flaggedIssues: c1Conversation.flaggedIssues ?? [],
+        statementSummaries: summariseStatements2(userStatements)
+      });
+      await db.update(analysisDrafts).set({
+        status: "ready",
+        facts: out.facts,
+        prose: out.prose,
+        panels: out.panels,
+        inputTokens: out.usage.inputTokens,
+        outputTokens: out.usage.outputTokens,
+        cacheReadTokens: out.usage.cacheReadTokens,
+        cacheCreationTokens: out.usage.cacheCreationTokens,
+        promptVersionIds: out.promptVersionIds,
+        generatedAt: /* @__PURE__ */ new Date()
+      }).where(eq14(analysisDrafts.id, created.id));
+      if (out.claims.length > 0) {
+        await db.insert(analysisClaims).values(
+          out.claims.map((c) => ({
+            draftId: created.id,
+            kind: c.kind,
+            anchorId: c.anchorId,
+            label: c.label,
+            category: c.category,
+            body: c.body,
+            evidenceRefs: c.evidenceRefs
+          }))
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "unknown_error";
+      console.error("[analysis_draft.refresh] build failed:", err);
+      await db.update(analysisDrafts).set({ status: "failed", errorMessage: message }).where(eq14(analysisDrafts.id, created.id));
+    }
+  })();
 });
 router7.get("/api/analysis-draft/:id/claims", async (req, res) => {
   const user = req.user;
@@ -3104,17 +3310,17 @@ var analysisConversation_default = router8;
 // server/routes/subStep.ts
 import { Router as Router9 } from "express";
 import { z as z9 } from "zod";
-import { and as and13, asc as asc4, desc as desc13, eq as eq17, isNull as isNull4, sql as sql3 } from "drizzle-orm";
+import { and as and13, asc as asc4, desc as desc13, eq as eq17, isNull as isNull5, sql as sql3 } from "drizzle-orm";
 
 // server/modules/subStep/orchestrator.ts
-import { and as and12, desc as desc12, eq as eq16, isNull as isNull3 } from "drizzle-orm";
+import { and as and12, desc as desc12, eq as eq16, isNull as isNull4 } from "drizzle-orm";
 async function getCurrentSubStep(userId) {
   const existing = await currentForUser(userId);
   if (existing) return existing;
   return await lazyBackfill(userId);
 }
 async function currentForUser(userId) {
-  const rows = await db.select().from(subSteps).where(and12(eq16(subSteps.userId, userId), isNull3(subSteps.supersededAt))).orderBy(desc12(subSteps.startedAt)).limit(1);
+  const rows = await db.select().from(subSteps).where(and12(eq16(subSteps.userId, userId), isNull4(subSteps.supersededAt))).orderBy(desc12(subSteps.startedAt)).limit(1);
   return rows[0] ?? null;
 }
 async function lazyBackfill(userId) {
@@ -3123,7 +3329,7 @@ async function lazyBackfill(userId) {
   const stmts = await db.select().from(statements).where(eq16(statements.userId, userId));
   const [latestAnalysis] = await db.select().from(analyses).where(and12(eq16(analyses.userId, userId), eq16(analyses.status, "done"))).orderBy(desc12(analyses.createdAt)).limit(1);
   const [conv] = await db.select().from(conversations).where(eq16(conversations.userId, userId)).limit(1);
-  const [latestDraft] = await db.select().from(analysisDrafts).where(and12(eq16(analysisDrafts.userId, userId), isNull3(analysisDrafts.supersededAt))).orderBy(desc12(analysisDrafts.createdAt)).limit(1);
+  const [latestDraft] = await db.select().from(analysisDrafts).where(and12(eq16(analysisDrafts.userId, userId), isNull4(analysisDrafts.supersededAt))).orderBy(desc12(analysisDrafts.createdAt)).limit(1);
   const derived = deriveCurrentFromLegacy({
     hasStatements: stmts.length > 0,
     hasBuildCompletedAt: !!user.buildCompletedAt,
@@ -3563,6 +3769,7 @@ async function runPictureAnalyse(userId, subStepId) {
       cacheCreationTokens: usage.cacheCreationTokens,
       completedAt: /* @__PURE__ */ new Date()
     }).where(eq17(analyses.id, analysis.id));
+    await persistCanvas1Claims(analysis.id, result);
     await db.update(subSteps).set({
       contentJson: { analysisId: analysis.id },
       updatedAt: /* @__PURE__ */ new Date()
@@ -3639,7 +3846,7 @@ async function startCanvas2ForUser(userId) {
     and13(
       eq17(subSteps.userId, userId),
       eq17(subSteps.canvasKey, "analysis"),
-      isNull4(subSteps.supersededAt)
+      isNull5(subSteps.supersededAt)
     )
   ).limit(1);
   if (existing) return;
@@ -3776,6 +3983,26 @@ function summariseStatements3(rows) {
       transactionCount: Array.isArray(r?.transactions) ? r.transactions.length : null
     };
   });
+}
+async function persistCanvas1Claims(analysisId, result) {
+  const r = result;
+  const claims = r.explainClaims ?? [];
+  if (claims.length === 0) return;
+  const phraseByAnchor = /* @__PURE__ */ new Map();
+  for (const a of r.lifeSnapshotAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.income?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.spending?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.savings?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  await db.insert(analysisClaims).values(
+    claims.map((c) => ({
+      analysisId,
+      kind: "explain",
+      anchorId: c.anchorId,
+      label: phraseByAnchor.get(c.anchorId) ?? c.label,
+      body: c.body,
+      evidenceRefs: { refs: c.evidenceRefs, chartKind: c.chartKind }
+    }))
+  );
 }
 var subStep_default = router9;
 

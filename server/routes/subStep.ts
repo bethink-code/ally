@@ -432,6 +432,11 @@ async function runPictureAnalyse(userId: string, subStepId: number): Promise<voi
       })
       .where(eq(analyses.id, analysis.id));
 
+    // Persist annotation/explain claims so StoryArticle can render clickable
+    // phrases and ExplainPane can resolve them. The schema (v5) emits
+    // *Annotations on each prose field plus a top-level explainClaims array.
+    await persistCanvas1Claims(analysis.id, result);
+
     // Record the analysis id on the sub-step and auto-advance into Discuss.
     await db
       .update(subSteps)
@@ -734,6 +739,49 @@ function summariseStatements(rows: Statement[]) {
       transactionCount: Array.isArray(r?.transactions) ? r.transactions.length : null,
     };
   });
+}
+
+// Insert Canvas 1 explain claims tied to an analyses row. The Canvas 1
+// `analysis` schema (v5) emits annotations per prose field + a top-level
+// explainClaims array. Each claim becomes one analysis_claims row with
+// kind="explain", analysisId set (NOT draftId — that's Canvas 2's column).
+async function persistCanvas1Claims(analysisId: number, result: unknown): Promise<void> {
+  type Claim = {
+    anchorId: string;
+    label: string;
+    body: string;
+    evidenceRefs: Array<{ kind: string; ref: string }>;
+    chartKind: string;
+  };
+  type Annotation = { kind: string; phrase: string; anchorId: string };
+  const r = result as {
+    explainClaims?: Claim[];
+    lifeSnapshotAnnotations?: Annotation[];
+    income?: { summaryAnnotations?: Annotation[] };
+    spending?: { summaryAnnotations?: Annotation[] };
+    savings?: { summaryAnnotations?: Annotation[] };
+  };
+  const claims = r.explainClaims ?? [];
+  if (claims.length === 0) return;
+
+  // Build a lookup of anchorId → label from annotations (so the persisted
+  // claim row carries the actual phrase the user clicked, not just the id).
+  const phraseByAnchor = new Map<string, string>();
+  for (const a of r.lifeSnapshotAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.income?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.spending?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.savings?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+
+  await db.insert(analysisClaims).values(
+    claims.map((c) => ({
+      analysisId,
+      kind: "explain" as const,
+      anchorId: c.anchorId,
+      label: phraseByAnchor.get(c.anchorId) ?? c.label,
+      body: c.body,
+      evidenceRefs: { refs: c.evidenceRefs, chartKind: c.chartKind } as unknown as object,
+    })),
+  );
 }
 
 export default router;

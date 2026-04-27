@@ -1,21 +1,29 @@
 import { Button } from "@/components/ui/button";
 import { formatMoney, formatPercent } from "@/lib/formatters";
+import { AnnotatedText, type InlineAnnotation } from "@/components/analysis/AnnotatedText";
 
 export type StoryAnalysisResult = {
   lifeSnapshot: string;
+  // Annotations are arrays of clickable phrases per text field. Each
+  // annotation has a matching explainClaim (anchorId → body) persisted to
+  // analysis_claims and resolved by ExplainPane on click.
+  lifeSnapshotAnnotations?: InlineAnnotation[];
   income: {
     summary: string;
+    summaryAnnotations?: InlineAnnotation[];
     monthlyAverage: number | null;
     regularity: "steady" | "variable" | "irregular";
     sources: { description: string; monthlyAverage: number; frequency: string }[];
   };
   spending: {
     summary: string;
+    summaryAnnotations?: InlineAnnotation[];
     monthlyAverage: number | null;
     byCategory: { category: string; monthlyAverage: number; percentOfSpend: number; examples: string[] }[];
   };
   savings: {
     summary: string;
+    summaryAnnotations?: InlineAnnotation[];
     monthlyAverageSaved: number | null;
     observation: string;
   };
@@ -42,11 +50,21 @@ export function StoryArticle({
     <article className="space-y-12">
       <section>
         <h2 className="font-serif text-3xl">Your money, as I see it.</h2>
-        <p className="mt-4 text-lg leading-relaxed text-foreground/90">{result.lifeSnapshot}</p>
+        <p className="mt-4 text-lg leading-relaxed text-foreground/90">
+          <AnnotatedText
+            text={result.lifeSnapshot}
+            annotations={result.lifeSnapshotAnnotations ?? []}
+          />
+        </p>
       </section>
 
       <Section title="Your income">
-        <p className="leading-relaxed">{result.income.summary}</p>
+        <p className="leading-relaxed">
+          <AnnotatedText
+            text={result.income.summary}
+            annotations={result.income.summaryAnnotations ?? []}
+          />
+        </p>
         {result.income.monthlyAverage != null && (
           <div className="pt-4">
             <BigNumber label="About what comes in, on average" value={formatMoney(result.income.monthlyAverage)} />
@@ -69,7 +87,12 @@ export function StoryArticle({
       </Section>
 
       <Section title="How your money moves">
-        <p className="leading-relaxed">{result.spending.summary}</p>
+        <p className="leading-relaxed">
+          <AnnotatedText
+            text={result.spending.summary}
+            annotations={result.spending.summaryAnnotations ?? []}
+          />
+        </p>
         {result.spending.monthlyAverage != null && (
           <div className="pt-4">
             <BigNumber label="About what goes out, on average" value={formatMoney(result.spending.monthlyAverage)} />
@@ -96,7 +119,12 @@ export function StoryArticle({
       </Section>
 
       <Section title="What's being set aside">
-        <p className="leading-relaxed">{result.savings.summary}</p>
+        <p className="leading-relaxed">
+          <AnnotatedText
+            text={result.savings.summary}
+            annotations={result.savings.summaryAnnotations ?? []}
+          />
+        </p>
         {result.savings.monthlyAverageSaved != null && (
           <div className="pt-4">
             <BigNumber

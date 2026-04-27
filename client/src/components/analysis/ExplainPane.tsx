@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import type { AnalysisClaim, AnalysisDraft as AnalysisDraftRow } from "@shared/schema";
+import type { Analysis, AnalysisClaim, AnalysisDraft as AnalysisDraftRow } from "@shared/schema";
 import type { CanvasKey } from "@/lib/canvasCopy";
 
 type EvidenceRefs = {
@@ -7,11 +7,13 @@ type EvidenceRefs = {
   chartKind?: string;
 };
 
-// The Explain mode of the Ally pane. Opens when a user clicks a highlighted claim
-// in the prose or a panel's anchor copy. Shows the claim restated + evidence.
+// The Explain mode of the Ally pane. Opens when a user clicks a highlighted
+// claim in the prose or a panel's anchor copy. Shows the claim restated +
+// evidence.
 //
-// Evidence visuals (charts) are allowed here — they're scoped to specific claims,
-// not the main draft experience (which is narrative-only).
+// Works for both canvases:
+//   picture  → claims live on /api/analysis/:id/claims (Canvas 1)
+//   analysis → claims live on /api/analysis-draft/:id/claims (Canvas 2)
 export function ExplainPane({
   canvas,
   anchorId,
@@ -21,27 +23,47 @@ export function ExplainPane({
   anchorId: string | null;
   onBack: () => void;
 }) {
+  // Canvas 1 source-of-truth — the latest done analysis.
+  const analysisQ = useQuery<Analysis | null>({
+    queryKey: ["/api/analysis/latest"],
+    enabled: canvas === "picture",
+  });
+  const analysisId = analysisQ.data?.id ?? null;
+  const pictureClaimsQ = useQuery<AnalysisClaim[]>({
+    queryKey: [`/api/analysis/${analysisId}/claims`],
+    enabled: canvas === "picture" && analysisId !== null,
+  });
+
+  // Canvas 2 source-of-truth — the current non-superseded draft.
   const draftQ = useQuery<AnalysisDraftRow | null>({
     queryKey: ["/api/analysis-draft/current"],
     enabled: canvas === "analysis",
   });
   const draftId = draftQ.data?.id ?? null;
-  const claimsQ = useQuery<AnalysisClaim[]>({
+  const analysisClaimsQ = useQuery<AnalysisClaim[]>({
     queryKey: [`/api/analysis-draft/${draftId}/claims`],
-    enabled: draftId !== null,
+    enabled: canvas === "analysis" && draftId !== null,
   });
 
-  if (canvas !== "analysis") {
-    return <EmptyState onBack={onBack}>Explain mode is only available on the analysis canvas.</EmptyState>;
+  if (canvas !== "picture" && canvas !== "analysis") {
+    return <EmptyState onBack={onBack}>Explain mode isn't available on this canvas yet.</EmptyState>;
   }
   if (!anchorId) {
-    return <EmptyState onBack={onBack}>Click a highlighted phrase on the left to see the evidence behind it.</EmptyState>;
-  }
-  if (!draftQ.isFetched || !claimsQ.isFetched) {
-    return <EmptyState onBack={onBack}>Loading…</EmptyState>;
+    return (
+      <EmptyState onBack={onBack}>
+        Click a highlighted phrase on the left to see the evidence behind it.
+      </EmptyState>
+    );
   }
 
-  const claim = (claimsQ.data ?? []).find((c) => c.anchorId === anchorId && c.kind === "explain");
+  const fetched =
+    canvas === "picture"
+      ? analysisQ.isFetched && (analysisId === null || pictureClaimsQ.isFetched)
+      : draftQ.isFetched && (draftId === null || analysisClaimsQ.isFetched);
+  if (!fetched) return <EmptyState onBack={onBack}>Loading…</EmptyState>;
+
+  const claims = canvas === "picture" ? pictureClaimsQ.data ?? [] : analysisClaimsQ.data ?? [];
+  const claim = claims.find((c) => c.anchorId === anchorId && c.kind === "explain");
   if (!claim) {
     return <EmptyState onBack={onBack}>Couldn't find the evidence for that one.</EmptyState>;
   }
@@ -107,9 +129,6 @@ function EmptyState({ children, onBack }: { children: React.ReactNode; onBack: (
   );
 }
 
-// Ring-fenced placeholder for the chart renderer. Evidence chart kinds (bar,
-// proportional, time-series) need a small deterministic chart library — not
-// a dashboarding framework. Wiring a real renderer is Part 7 polish.
 function EvidenceChartPlaceholder({ chartKind }: { chartKind: string }) {
   return (
     <div className="rounded-md border border-dashed border-border bg-muted/30 px-4 py-6">

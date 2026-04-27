@@ -38,9 +38,11 @@ export function AnalysisProse({
   }
 
   return (
-    <article className="space-y-12 max-w-2xl">
-      {/* Top-level orienting title — mirror of Canvas 1's "Your money, as I see it.".
-          Without this the reader has no anchor for what they're looking at. */}
+    // Full-width article (no max-w cap) + matching vertical rhythm to
+    // StoryArticle. Canvas 1's reference visual: serif heading, 3xl;
+    // opening paragraph at text-lg/leading-relaxed; sections at space-y-12;
+    // section heads at serif text-2xl mb-4; body at text-foreground/90.
+    <article className="space-y-12">
       <header>
         <h2 className="font-serif text-3xl">Our analysis.</h2>
         {sections[0] && sections[0].paragraphs[0] && !sections[0].heading && (
@@ -55,15 +57,13 @@ export function AnalysisProse({
 
       {sections.map((section, idx) => {
         const isOpening = idx === 0 && !section.heading;
-        // Opening section: top paragraph is rendered in the header above.
-        // Render any remaining paragraphs as flat prose under the title.
         const paragraphs = isOpening ? section.paragraphs.slice(1) : section.paragraphs;
         if (paragraphs.length === 0 && isOpening) return null;
         const heading = section.heading || (isOpening ? null : humanise(section.id));
         return (
           <section key={section.id}>
             {heading && <h3 className="font-serif text-2xl mb-4">{heading}</h3>}
-            <div className="space-y-2 text-foreground/90 leading-relaxed">
+            <div className="space-y-3 text-foreground/90 leading-relaxed">
               {paragraphs.map((para, i) => (
                 <p key={i}>
                   <AnnotatedText

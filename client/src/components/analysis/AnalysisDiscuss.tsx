@@ -4,6 +4,7 @@ import { PaneHeader } from "@/components/layout/PaneHeader";
 import { UserAvatar, getInitials } from "@/components/layout/Avatars";
 import { PhaseActionBar, type PhaseStep } from "@/components/PhaseActionBar";
 import { AgreementGate } from "@/components/AgreementGate";
+import { RefreshArtefactBar } from "@/components/RefreshArtefactBar";
 import { useAuth } from "@/hooks/useAuth";
 import { BEAT_LABEL, BEAT_STATUS_LINE } from "@/lib/canvasCopy";
 import type { AnalysisClaim, AnalysisDraft as AnalysisDraftRow, SubStep } from "@shared/schema";
@@ -70,7 +71,8 @@ export function AnalysisDiscuss({
       />
       <div className="flex-1 min-h-0 overflow-y-auto shadow-[inset_0_0_0_4px_var(--color-muted)]">
         {draft ? (
-          <div className="px-8 py-6">
+          <div className="px-6 py-8">
+            {!peek && <RefreshArtefactBar canvas="analysis" />}
             <FormatToggle />
             <div className="mt-4">
               {format === "text" ? (
