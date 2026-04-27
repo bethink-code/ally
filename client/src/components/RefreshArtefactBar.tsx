@@ -59,23 +59,27 @@ export function RefreshArtefactBar({ canvas }: RefreshArtefactBarProps) {
     }
   }, [latestQ.data?.id, refreshing, canvas, queryClient]);
 
+  // Mounted in the dark foot bar (PhaseActionBar tertiary slot) — colors
+  // inverted vs. a light surface. While refreshing, the in-flight pulse
+  // sits left of the button so the user has a live indicator without
+  // having to look elsewhere.
   return (
-    <div className="flex items-center justify-end gap-3 -mt-2 mb-6">
+    <div className="flex items-center gap-3">
       {refreshing && (
-        <span className="text-xs text-muted-foreground italic flex items-center gap-2">
+        <span className="text-xs text-background/70 italic flex items-center gap-2">
           <span className="flex items-center gap-1" aria-hidden>
-            <span className="h-1.5 w-1.5 rounded-full bg-accent/80 animate-pulse [animation-delay:0ms]" />
-            <span className="h-1.5 w-1.5 rounded-full bg-accent/80 animate-pulse [animation-delay:200ms]" />
-            <span className="h-1.5 w-1.5 rounded-full bg-accent/80 animate-pulse [animation-delay:400ms]" />
+            <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse [animation-delay:0ms]" />
+            <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse [animation-delay:200ms]" />
+            <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse [animation-delay:400ms]" />
           </span>
-          Ally is rewriting with your latest input…
+          rewriting…
         </span>
       )}
       <button
         type="button"
         onClick={() => trigger.mutate()}
         disabled={refreshing || trigger.isPending}
-        className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+        className="inline-flex items-center gap-1.5 rounded-md border border-background/30 bg-transparent px-3 py-1.5 text-xs font-medium text-background hover:bg-background/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         title="Re-run the analysis with the latest chat corrections"
       >
         <span aria-hidden className={refreshing || trigger.isPending ? "animate-spin inline-block" : "inline-block"}>↻</span>

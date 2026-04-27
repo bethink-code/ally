@@ -66,7 +66,6 @@ export function PictureDiscuss({
       <div className="flex-1 min-h-0 overflow-y-auto shadow-[inset_0_0_0_4px_var(--color-muted)]">
         {storyResult ? (
           <div className="px-6 py-8">
-            {!peek && <RefreshArtefactBar canvas="picture" />}
             <StoryArticle result={storyResult} />
             {/* Supporting-doc attach zone — stubbed for Slice 1.
                 Full mid-Discuss document extraction defers to Slice 2. */}
@@ -91,6 +90,7 @@ export function PictureDiscuss({
                 disabled: !storyResult,
               }
         }
+        tertiary={!peek ? <RefreshArtefactBar canvas="picture" /> : undefined}
       />
 
       {!peek && (

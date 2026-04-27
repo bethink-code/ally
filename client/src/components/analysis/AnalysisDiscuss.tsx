@@ -72,7 +72,6 @@ export function AnalysisDiscuss({
       <div className="flex-1 min-h-0 overflow-y-auto shadow-[inset_0_0_0_4px_var(--color-muted)]">
         {draft ? (
           <div className="px-6 py-8">
-            {!peek && <RefreshArtefactBar canvas="analysis" />}
             <FormatToggle />
             <div className="mt-4">
               {format === "text" ? (
@@ -99,6 +98,7 @@ export function AnalysisDiscuss({
                 disabled: !draft,
               }
         }
+        tertiary={!peek ? <RefreshArtefactBar canvas="analysis" /> : undefined}
       />
 
       {!peek && (

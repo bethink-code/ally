@@ -1,7 +1,12 @@
-// Pinned-bottom action bar. Carries the primary forward action and an optional
-// secondary action for the current moment. The mini-timeline that used to live
-// here moved into the pane header (PaneHeader's `steps` prop) — the foot is
-// now action-only, with secondary on the left and primary on the right.
+import type { ReactNode } from "react";
+
+// Pinned-bottom action bar. Three columns:
+//   left   — secondary (soft, optional, e.g. "Something's not right")
+//   center — tertiary (slot for in-flight artefact actions like Refresh)
+//   right  — primary (the forward CTA)
+//
+// The mini-timeline used to live here; it moved to PaneHeader's `steps`
+// prop. The foot is now action-only.
 
 export type PhaseStep = {
   key: string;
@@ -14,26 +19,31 @@ export type PhaseStep = {
 export function PhaseActionBar({
   primary,
   secondary,
+  tertiary,
 }: {
   primary?: { label: string; onClick: () => void; disabled?: boolean };
   secondary?: { label: string; onClick: () => void; disabled?: boolean };
+  /** Free slot for an action like Refresh. Caller renders the JSX so it
+   *  can carry its own state (refreshing, pulse indicator, etc.). */
+  tertiary?: ReactNode;
 }) {
   return (
     <div className="shrink-0 bg-foreground text-background">
-      <div className="flex items-center gap-6 px-6 py-4 min-h-[70px]">
-        {secondary ? (
-          <button
-            type="button"
-            onClick={secondary.onClick}
-            disabled={secondary.disabled}
-            className="px-3 py-2 text-xs text-background/70 hover:text-background disabled:opacity-60 transition-colors"
-          >
-            {secondary.label}
-          </button>
-        ) : (
-          <span aria-hidden />
-        )}
-        <div className="ml-auto">
+      <div className="grid grid-cols-3 items-center gap-6 px-6 py-4 min-h-[70px]">
+        <div className="flex justify-start">
+          {secondary && (
+            <button
+              type="button"
+              onClick={secondary.onClick}
+              disabled={secondary.disabled}
+              className="px-3 py-2 text-xs text-background/70 hover:text-background disabled:opacity-60 transition-colors"
+            >
+              {secondary.label}
+            </button>
+          )}
+        </div>
+        <div className="flex justify-center">{tertiary}</div>
+        <div className="flex justify-end">
           {primary && (
             <button
               type="button"
