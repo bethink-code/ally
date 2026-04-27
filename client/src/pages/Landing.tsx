@@ -43,6 +43,16 @@ export default function Landing() {
             You don't have access yet. Request an invitation below.
           </div>
         )}
+        {urlError === "oauth_failed" && (
+          <div className="rounded-md border border-amber-400/40 bg-amber-50 p-3 text-sm text-amber-900">
+            Sign-in didn't go through — Google returned an error. Click "Sign in with Google" again.
+          </div>
+        )}
+        {urlError && urlError !== "not_invited" && urlError !== "oauth_failed" && (
+          <div className="rounded-md border border-amber-400/40 bg-amber-50 p-3 text-sm text-amber-900">
+            Something went wrong on the way back from sign-in. Please try again.
+          </div>
+        )}
 
         {!requestMode ? (
           <div className="space-y-4">
