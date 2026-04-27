@@ -68,6 +68,7 @@ export function AnalysisAnalyse({
             title={displayName ? `Writing your analysis, ${displayName}…` : "Writing your analysis…"}
             expectedSeconds={90}
             rotatorLabel="While I write · a short story"
+            canvas="analysis"
             errorMessage={subStep.errorMessage}
             onRetry={() => retry.mutate()}
           />

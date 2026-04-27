@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { StoryRotator } from "@/components/StoryRotator";
 import { WaitProgress } from "@/components/WaitProgress";
+import { AllyNarration } from "@/components/AllyNarration";
 
 // The reusable shell for the Analyse beat on any canvas. Ally is at work;
 // the person is witnessing. See architecture spec §4 "Ally at work".
@@ -21,6 +22,7 @@ export function AllyAtWork({
   title,
   expectedSeconds,
   rotatorLabel = "While I work · a short story",
+  canvas,
   errorMessage,
   onRetry,
   onSkip,
@@ -29,6 +31,8 @@ export function AllyAtWork({
   title: string;
   expectedSeconds: number;
   rotatorLabel?: string;
+  /** Canvas drives which narration stages cycle ("Reading…" vs "Drafting…"). */
+  canvas?: "picture" | "analysis";
   errorMessage?: string | null;
   onRetry?: () => void;
   onSkip?: () => void;
@@ -57,6 +61,11 @@ export function AllyAtWork({
       <div className={softened ? "opacity-70" : undefined}>
         <WaitProgress expectedSeconds={expectedSeconds} />
       </div>
+      {canvas && (
+        <div className="min-h-[2rem]">
+          <AllyNarration canvas={canvas} />
+        </div>
+      )}
       <div className="w-full max-w-2xl pt-2">
         <StoryRotator label={rotatorLabel} />
       </div>

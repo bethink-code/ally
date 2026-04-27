@@ -66,6 +66,7 @@ export function PictureAnalyse({
             title={displayName ? `Reading your year, ${displayName}…` : "Reading across everything you've shared…"}
             expectedSeconds={75}
             rotatorLabel="While I read · a short story"
+            canvas="picture"
             errorMessage={subStep.errorMessage}
             onRetry={() => retry.mutate()}
           />
