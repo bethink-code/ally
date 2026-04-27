@@ -57,8 +57,11 @@ export async function analyseStatements(input: AnalyseInput): Promise<AnalyseOut
     throw new Error("Analysis returned no parsed output");
   }
 
+  // Drop orphan annotations / unreferenced claims before handing back, so
+  // every clickable phrase in the rendered prose has a body to display.
+  const result = sanitizeAnalysisResult(response.parsed_output) as AnalysisResult;
   return {
-    result: response.parsed_output,
+    result,
     usage: {
       inputTokens: response.usage.input_tokens,
       outputTokens: response.usage.output_tokens,
@@ -66,6 +69,49 @@ export async function analyseStatements(input: AnalyseInput): Promise<AnalyseOut
       cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
     },
   };
+}
+
+// Drop any annotation whose anchorId doesn't have a matching explainClaim,
+// and drop any explainClaim whose anchorId isn't referenced by an
+// annotation. The LLM occasionally emits one without the other; without
+// this sanitiser the user clicks a highlighted phrase and lands on
+// "Couldn't find the evidence for that one." Idempotent — safe to call on
+// already-sanitised results.
+export function sanitizeAnalysisResult(result: unknown): unknown {
+  type Annotation = { kind: string; phrase: string; anchorId: string };
+  type Claim = { anchorId: string; [k: string]: unknown };
+  const r = result as {
+    lifeSnapshotAnnotations?: Annotation[];
+    income?: { summaryAnnotations?: Annotation[] } & Record<string, unknown>;
+    spending?: { summaryAnnotations?: Annotation[] } & Record<string, unknown>;
+    savings?: { summaryAnnotations?: Annotation[] } & Record<string, unknown>;
+    explainClaims?: Claim[];
+  } & Record<string, unknown>;
+  if (!r || typeof r !== "object") return result;
+
+  const claims = r.explainClaims ?? [];
+  const claimAnchors = new Set(claims.map((c) => c.anchorId));
+  const annotationAnchors = new Set<string>();
+
+  const filterAnns = (anns?: Annotation[]) =>
+    (anns ?? []).filter((a) => {
+      if (claimAnchors.has(a.anchorId)) {
+        annotationAnchors.add(a.anchorId);
+        return true;
+      }
+      return false;
+    });
+
+  const sanitised = {
+    ...r,
+    lifeSnapshotAnnotations: filterAnns(r.lifeSnapshotAnnotations),
+    income: r.income ? { ...r.income, summaryAnnotations: filterAnns(r.income.summaryAnnotations) } : r.income,
+    spending: r.spending ? { ...r.spending, summaryAnnotations: filterAnns(r.spending.summaryAnnotations) } : r.spending,
+    savings: r.savings ? { ...r.savings, summaryAnnotations: filterAnns(r.savings.summaryAnnotations) } : r.savings,
+    // Drop claims that no annotation references — they'd be unreachable.
+    explainClaims: claims.filter((c) => annotationAnchors.has(c.anchorId)),
+  };
+  return sanitised;
 }
 
 function buildUserMessage(

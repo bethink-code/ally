@@ -24,16 +24,23 @@ export function AnnotatedText({
 
   for (const ann of annotations) {
     // Walk existing pieces and split any text piece that contains this phrase.
+    // Match is case-INSENSITIVE — the LLM frequently emits lowercase phrases
+    // for sentence-starting clauses while the prose has them capitalised
+    // ("nine invoices..." in annotation vs "Nine invoices..." in prose).
+    // We preserve the prose's original casing in the rendered span by
+    // slicing the matched range out of the original text, not the phrase.
+    const lowPhrase = ann.phrase.toLowerCase();
     for (let i = 0; i < pieces.length; i++) {
       const p = pieces[i];
       if (p.kind !== "text") continue;
-      const idx = p.text.indexOf(ann.phrase);
+      const idx = p.text.toLowerCase().indexOf(lowPhrase);
       if (idx < 0) continue;
       const before = p.text.slice(0, idx);
+      const matched = p.text.slice(idx, idx + ann.phrase.length); // preserve original case
       const after = p.text.slice(idx + ann.phrase.length);
       const replacement: Piece[] = [];
       if (before) replacement.push({ kind: "text", text: before });
-      replacement.push({ kind: "ann", ann, text: ann.phrase });
+      replacement.push({ kind: "ann", ann, text: matched });
       if (after) replacement.push({ kind: "text", text: after });
       pieces.splice(i, 1, ...replacement);
       break; // only first match per annotation

@@ -1148,8 +1148,9 @@ async function analyseStatements(input) {
   if (!response.parsed_output) {
     throw new Error("Analysis returned no parsed output");
   }
+  const result = sanitizeAnalysisResult(response.parsed_output);
   return {
-    result: response.parsed_output,
+    result,
     usage: {
       inputTokens: response.usage.input_tokens,
       outputTokens: response.usage.output_tokens,
@@ -1157,6 +1158,30 @@ async function analyseStatements(input) {
       cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0
     }
   };
+}
+function sanitizeAnalysisResult(result) {
+  const r = result;
+  if (!r || typeof r !== "object") return result;
+  const claims = r.explainClaims ?? [];
+  const claimAnchors = new Set(claims.map((c) => c.anchorId));
+  const annotationAnchors = /* @__PURE__ */ new Set();
+  const filterAnns = (anns) => (anns ?? []).filter((a) => {
+    if (claimAnchors.has(a.anchorId)) {
+      annotationAnchors.add(a.anchorId);
+      return true;
+    }
+    return false;
+  });
+  const sanitised = {
+    ...r,
+    lifeSnapshotAnnotations: filterAnns(r.lifeSnapshotAnnotations),
+    income: r.income ? { ...r.income, summaryAnnotations: filterAnns(r.income.summaryAnnotations) } : r.income,
+    spending: r.spending ? { ...r.spending, summaryAnnotations: filterAnns(r.spending.summaryAnnotations) } : r.spending,
+    savings: r.savings ? { ...r.savings, summaryAnnotations: filterAnns(r.savings.summaryAnnotations) } : r.savings,
+    // Drop claims that no annotation references — they'd be unreachable.
+    explainClaims: claims.filter((c) => annotationAnchors.has(c.anchorId))
+  };
+  return sanitised;
 }
 function buildUserMessage(statements2, profile, flaggedIssues) {
   const header = `You are being given ${statements2.length} extracted bank statements covering a period of months. Analyse the whole set together, not one at a time.
@@ -1238,6 +1263,7 @@ router5.post("/api/analysis/run", async (req, res) => {
       cacheCreationTokens: usage.cacheCreationTokens,
       completedAt: /* @__PURE__ */ new Date()
     }).where(eq7(analyses.id, created.id)).returning();
+    await persistAnalysisClaims(created.id, result);
     audit({
       req,
       action: "analysis.success",
@@ -1293,25 +1319,7 @@ router5.post("/api/analysis/refresh", async (req, res) => {
         cacheCreationTokens: usage.cacheCreationTokens,
         completedAt: /* @__PURE__ */ new Date()
       }).where(eq7(analyses.id, created.id));
-      const r = result;
-      const claims = r.explainClaims ?? [];
-      if (claims.length > 0) {
-        const phraseByAnchor = /* @__PURE__ */ new Map();
-        for (const a of r.lifeSnapshotAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
-        for (const a of r.income?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
-        for (const a of r.spending?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
-        for (const a of r.savings?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
-        await db.insert(analysisClaims).values(
-          claims.map((c) => ({
-            analysisId: created.id,
-            kind: "explain",
-            anchorId: c.anchorId,
-            label: phraseByAnchor.get(c.anchorId) ?? c.label,
-            body: c.body,
-            evidenceRefs: { refs: c.evidenceRefs, chartKind: c.chartKind }
-          }))
-        );
-      }
+      await persistAnalysisClaims(created.id, result);
       await db.update(subSteps).set({
         contentJson: { analysisId: created.id },
         updatedAt: /* @__PURE__ */ new Date()
@@ -1329,6 +1337,26 @@ router5.post("/api/analysis/refresh", async (req, res) => {
     }
   })();
 });
+async function persistAnalysisClaims(analysisId, result) {
+  const r = result;
+  const claims = r.explainClaims ?? [];
+  if (claims.length === 0) return;
+  const phraseByAnchor = /* @__PURE__ */ new Map();
+  for (const a of r.lifeSnapshotAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.income?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.spending?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.savings?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  await db.insert(analysisClaims).values(
+    claims.map((c) => ({
+      analysisId,
+      kind: "explain",
+      anchorId: c.anchorId,
+      label: phraseByAnchor.get(c.anchorId) ?? c.label,
+      body: c.body,
+      evidenceRefs: { refs: c.evidenceRefs, chartKind: c.chartKind }
+    }))
+  );
+}
 var analysis_default = router5;
 
 // server/routes/qa.ts

@@ -97,6 +97,11 @@ router.post("/api/analysis/run", async (req, res) => {
       .where(eq(analyses.id, created.id))
       .returning();
 
+    // Persist explain claims so StoryArticle's clickable phrases resolve.
+    // (The /refresh and sub-step worker paths already do this; this route
+    // was the orphan caller.)
+    await persistAnalysisClaims(created.id, result);
+
     audit({
       req,
       action: "analysis.success",
@@ -188,42 +193,7 @@ router.post("/api/analysis/refresh", async (req, res) => {
         })
         .where(eq(analyses.id, created.id));
 
-      // Persist explain claims for the new analysis (same logic as the
-      // initial first-take pass — see persistCanvas1Claims in subStep.ts).
-      // Inlined here to avoid a cross-route import.
-      type Claim = {
-        anchorId: string;
-        label: string;
-        body: string;
-        evidenceRefs: Array<{ kind: string; ref: string }>;
-        chartKind: string;
-      };
-      type Annotation = { kind: string; phrase: string; anchorId: string };
-      const r = result as {
-        explainClaims?: Claim[];
-        lifeSnapshotAnnotations?: Annotation[];
-        income?: { summaryAnnotations?: Annotation[] };
-        spending?: { summaryAnnotations?: Annotation[] };
-        savings?: { summaryAnnotations?: Annotation[] };
-      };
-      const claims = r.explainClaims ?? [];
-      if (claims.length > 0) {
-        const phraseByAnchor = new Map<string, string>();
-        for (const a of r.lifeSnapshotAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
-        for (const a of r.income?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
-        for (const a of r.spending?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
-        for (const a of r.savings?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
-        await db.insert(analysisClaims).values(
-          claims.map((c) => ({
-            analysisId: created.id,
-            kind: "explain" as const,
-            anchorId: c.anchorId,
-            label: phraseByAnchor.get(c.anchorId) ?? c.label,
-            body: c.body,
-            evidenceRefs: { refs: c.evidenceRefs, chartKind: c.chartKind } as unknown as object,
-          })),
-        );
-      }
+      await persistAnalysisClaims(created.id, result);
 
       // Repoint the user's current Discuss/Live picture sub-step at the new
       // analysis so any consumer reading contentJson.analysisId sees the
@@ -251,5 +221,45 @@ router.post("/api/analysis/refresh", async (req, res) => {
     }
   })();
 });
+
+// Persist Canvas 1 explain claims for an analyses row. Used by /run +
+// /refresh; the sub-step worker has its own (functionally-equivalent) copy.
+// All three feed the same analysis_claims table with analysis_id set.
+async function persistAnalysisClaims(analysisId: number, result: unknown): Promise<void> {
+  type Claim = {
+    anchorId: string;
+    label: string;
+    body: string;
+    evidenceRefs: Array<{ kind: string; ref: string }>;
+    chartKind: string;
+  };
+  type Annotation = { kind: string; phrase: string; anchorId: string };
+  const r = result as {
+    explainClaims?: Claim[];
+    lifeSnapshotAnnotations?: Annotation[];
+    income?: { summaryAnnotations?: Annotation[] };
+    spending?: { summaryAnnotations?: Annotation[] };
+    savings?: { summaryAnnotations?: Annotation[] };
+  };
+  const claims = r.explainClaims ?? [];
+  if (claims.length === 0) return;
+
+  const phraseByAnchor = new Map<string, string>();
+  for (const a of r.lifeSnapshotAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.income?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.spending?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+  for (const a of r.savings?.summaryAnnotations ?? []) phraseByAnchor.set(a.anchorId, a.phrase);
+
+  await db.insert(analysisClaims).values(
+    claims.map((c) => ({
+      analysisId,
+      kind: "explain" as const,
+      anchorId: c.anchorId,
+      label: phraseByAnchor.get(c.anchorId) ?? c.label,
+      body: c.body,
+      evidenceRefs: { refs: c.evidenceRefs, chartKind: c.chartKind } as unknown as object,
+    })),
+  );
+}
 
 export default router;

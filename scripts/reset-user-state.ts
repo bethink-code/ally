@@ -90,9 +90,18 @@ async function main() {
   // 9. analysis_conversations (refs analysis_drafts via draftId)
   await db.delete(analysisConversations).where(eq(analysisConversations.userId, userId));
 
-  // 10. analysis_claims (refs analysis_drafts)
+  // 10. analysis_claims — delete BOTH the draft-tied AND the analysis-tied
+  //     claims. analysis_claims is now polymorphic (draft_id OR analysis_id).
   if (draftIds.length > 0) {
     await db.delete(analysisClaims).where(inArray(analysisClaims.draftId, draftIds));
+  }
+  // Also pull in any analyses owned by this user so we can delete their
+  // analysis_id-tied claims before deleting the analyses rows themselves.
+  const analysisIds = (
+    await db.select({ id: analyses.id }).from(analyses).where(eq(analyses.userId, userId))
+  ).map((r) => r.id);
+  if (analysisIds.length > 0) {
+    await db.delete(analysisClaims).where(inArray(analysisClaims.analysisId, analysisIds));
   }
   // 11. analysis_drafts (refs conversations + analyses)
   await db.delete(analysisDrafts).where(eq(analysisDrafts.userId, userId));
