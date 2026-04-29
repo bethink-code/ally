@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
 import { formatDateLong } from "@/lib/formatters";
 import type { StepRelation, Step } from "@/lib/steps";
@@ -239,8 +240,58 @@ export function StepController({
 
   const isPlaceholder = canvas === "plan" || canvas === "progress";
   const ctaIsBack = relation === "future" || isPlaceholder;
-  const ctaLabel = ctaIsBack ? "Back to current →" : copy.cta[relation as "past" | "current"];
-  const ctaAction = ctaIsBack ? onBackToCurrent : onCta;
+
+  // Work-pass entrypoints: clicking the CTA on these doesn't just navigate,
+  // it actually triggers Ally to do the work again with the user's current
+  // understanding (statements + reinterpretation rules + chat context). The
+  // controller IS the coordinator — click = run the engine.
+  //   picture/draft → POST /api/analysis/refresh   (Canvas 1)
+  //   analysis/draft → POST /api/analysis-draft/refresh  (Canvas 2)
+  // Other steps just navigate (gather is user-driven; discuss/live don't
+  // re-derive anything).
+  const isWorkPass =
+    !ctaIsBack &&
+    step === "draft" &&
+    (canvas === "picture" || canvas === "analysis");
+
+  const refreshMut = useMutation({
+    mutationFn: async () => {
+      if (canvas === "picture") {
+        await apiRequest("POST", "/api/analysis/refresh");
+      } else if (canvas === "analysis") {
+        await apiRequest("POST", "/api/analysis-draft/refresh");
+      }
+    },
+    onSuccess: () => {
+      // Surface the new in-progress row immediately so the work surface
+      // (PictureDraft / AnalysisDraft) renders AllyAtWork instead of
+      // AnalysePeek when we navigate there next.
+      queryClient.invalidateQueries({ queryKey: ["/api/analysis/in-progress"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/analysis-draft/in-progress"] });
+    },
+  });
+
+  const ctaLabel = ctaIsBack
+    ? "Back to current →"
+    : refreshMut.isPending
+    ? "Re-reading…"
+    : copy.cta[relation as "past" | "current"];
+
+  const ctaAction = ctaIsBack
+    ? onBackToCurrent
+    : isWorkPass
+    ? async () => {
+        try {
+          await refreshMut.mutateAsync();
+        } catch (err) {
+          // Refresh failed — still navigate so user isn't stuck on the
+          // landing card. The error will surface on the work surface
+          // (sub_step.errorMessage / hit_problem mode).
+          console.warn("[StepController] refresh failed:", err);
+        }
+        onCta();
+      }
+    : onCta;
 
   return (
     <div className="flex flex-col items-center justify-center h-full px-6 text-center">
@@ -263,7 +314,7 @@ export function StepController({
             {copy.closed}
           </p>
         )}
-        <Button onClick={ctaAction}>{ctaLabel}</Button>
+        <Button onClick={ctaAction} disabled={refreshMut.isPending}>{ctaLabel}</Button>
       </div>
     </div>
   );

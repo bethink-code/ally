@@ -70,6 +70,7 @@ export async function refreshCanvas1Analysis(
         conversationProfile: conv?.profile ?? null,
         flaggedIssues: conv?.flaggedIssues ?? [],
         subjectAggregates: aggregatesBySubject,
+        rawTransactions: allTransactions,
       });
       await db
         .update(analyses)

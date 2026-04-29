@@ -439,6 +439,7 @@ async function runPictureAnalyse(userId: string, subStepId: number): Promise<voi
       model: prompt.model,
       statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
       subjectAggregates: aggregatesBySubject,
+      rawTransactions: allTransactions,
     });
 
     await db

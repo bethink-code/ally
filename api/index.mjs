@@ -1295,6 +1295,101 @@ function formatAggregatesForPrompt(aggregates) {
   return lines.join("\n");
 }
 
+// server/modules/reinterpretation/override.ts
+function overrideAnalysisResult(result, aggregates, transactions) {
+  if (!result || typeof result !== "object") return result;
+  const r = { ...result };
+  if (Object.keys(aggregates).length === 0) return r;
+  const months = monthsCovered(transactions);
+  if (months <= 0) return r;
+  const byCategory = {};
+  for (const a of Object.values(aggregates)) {
+    const cat = a.subject.split(".")[0];
+    (byCategory[cat] ??= []).push(a);
+  }
+  if (byCategory.income && byCategory.income.length > 0) {
+    r.income = applyIncomeOverride(r.income ?? {}, byCategory.income, months);
+  }
+  if (byCategory.spending && byCategory.spending.length > 0) {
+    r.spending = applySpendingOverride(r.spending ?? {}, byCategory.spending, months);
+  }
+  if (byCategory.savings && byCategory.savings.length > 0) {
+    r.savings = applySavingsOverride(r.savings ?? {}, byCategory.savings, months);
+  }
+  return r;
+}
+function applyIncomeOverride(income, aggs, months) {
+  const sources = aggs.map((a) => ({
+    description: deriveSourceDescription(a),
+    monthlyAverage: round(a.totalCredits / months),
+    frequency: deriveFrequency(a.countCredits, months)
+  }));
+  const totalMonthly = sources.reduce((sum, s) => sum + s.monthlyAverage, 0);
+  return {
+    ...income,
+    monthlyAverage: totalMonthly,
+    sources,
+    // Regularity: if any single subject has many fragments, flag as variable.
+    regularity: aggs.some((a) => a.countCredits > months * 2) ? "variable" : income.regularity ?? "steady"
+  };
+}
+function applySpendingOverride(spending, aggs, months) {
+  const ruledMonthly = aggs.reduce((sum, a) => sum + a.totalDebits / months, 0);
+  const otherMonthly = (spending.byCategory ?? []).reduce((sum, c) => sum + c.monthlyAverage, 0);
+  const totalMonthly = round(ruledMonthly + otherMonthly);
+  const ruledCategories = aggs.map((a) => {
+    const monthly = round(a.totalDebits / months);
+    return {
+      category: deriveSourceDescription(a),
+      monthlyAverage: monthly,
+      percentOfSpend: totalMonthly > 0 ? monthly / totalMonthly : 0,
+      examples: a.samples.slice(0, 5).map((t) => t.description)
+    };
+  });
+  const llmCategories = (spending.byCategory ?? []).map((c) => ({
+    ...c,
+    percentOfSpend: totalMonthly > 0 ? c.monthlyAverage / totalMonthly : c.percentOfSpend
+  }));
+  return {
+    ...spending,
+    monthlyAverage: totalMonthly,
+    byCategory: [...ruledCategories, ...llmCategories].sort((a, b) => b.monthlyAverage - a.monthlyAverage)
+  };
+}
+function applySavingsOverride(savings, aggs, months) {
+  const netMonthly = aggs.reduce((sum, a) => sum + a.netFlow / months, 0);
+  return {
+    ...savings,
+    monthlyAverageSaved: round(netMonthly)
+  };
+}
+function monthsCovered(transactions) {
+  if (transactions.length === 0) return 0;
+  const dates = transactions.map((t) => t.date).sort();
+  const first = new Date(dates[0]);
+  const last = new Date(dates[dates.length - 1]);
+  if (Number.isNaN(first.getTime()) || Number.isNaN(last.getTime())) return 0;
+  const months = (last.getFullYear() - first.getFullYear()) * 12 + (last.getMonth() - first.getMonth()) + 1;
+  return Math.max(months, 1);
+}
+function deriveSourceDescription(a) {
+  const rationale = a.rationales[0];
+  if (rationale && rationale.length > 0) {
+    return rationale.length <= 80 ? rationale : rationale.slice(0, 77) + "\u2026";
+  }
+  return a.subject;
+}
+function deriveFrequency(countCredits, months) {
+  if (months === 0) return "irregular";
+  const perMonth = countCredits / months;
+  if (perMonth > 2) return "fragmented (multiple deposits per month)";
+  if (perMonth > 0.8 && perMonth < 1.2) return "monthly";
+  return "irregular";
+}
+function round(n) {
+  return Math.round(n * 100) / 100;
+}
+
 // server/modules/analysis/analyse.ts
 var client2 = new Anthropic2();
 async function analyseStatements(input) {
@@ -1327,7 +1422,14 @@ async function analyseStatements(input) {
   if (!response.parsed_output) {
     throw new Error("Analysis returned no parsed output");
   }
-  const result = sanitizeAnalysisResult(response.parsed_output);
+  let result = sanitizeAnalysisResult(response.parsed_output);
+  if (input.subjectAggregates && input.rawTransactions) {
+    result = overrideAnalysisResult(
+      result,
+      input.subjectAggregates,
+      input.rawTransactions
+    );
+  }
   return {
     result,
     usage: {
@@ -1519,7 +1621,8 @@ async function refreshCanvas1Analysis(userId) {
         statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
         conversationProfile: conv?.profile ?? null,
         flaggedIssues: conv?.flaggedIssues ?? [],
-        subjectAggregates: aggregatesBySubject
+        subjectAggregates: aggregatesBySubject,
+        rawTransactions: allTransactions
       });
       await db.update(analyses).set({
         status: "done",
@@ -1573,6 +1676,11 @@ async function persistAnalysisClaims(analysisId, result) {
 // server/routes/analysis.ts
 var router5 = Router5();
 router5.use(isAuthenticated);
+router5.get("/api/analysis/in-progress", async (req, res) => {
+  const user = req.user;
+  const [row] = await db.select().from(analyses).where(and6(eq9(analyses.userId, user.id), eq9(analyses.status, "analysing"))).orderBy(desc5(analyses.createdAt)).limit(1);
+  res.json(row ?? null);
+});
 router5.get("/api/analysis/latest", async (req, res) => {
   const user = req.user;
   const [row] = await db.select().from(analyses).where(and6(eq9(analyses.userId, user.id), eq9(analyses.status, "done"))).orderBy(desc5(analyses.createdAt)).limit(1);
@@ -1624,7 +1732,8 @@ router5.post("/api/analysis/run", async (req, res) => {
       systemPrompt: prompt.content,
       model: prompt.model,
       statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
-      subjectAggregates: aggregatesBySubject
+      subjectAggregates: aggregatesBySubject,
+      rawTransactions: allTransactions
     });
     const [finished] = await db.update(analyses).set({
       status: "done",
@@ -4179,7 +4288,8 @@ async function runPictureAnalyse(userId, subStepId) {
       systemPrompt: prompt.content,
       model: prompt.model,
       statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
-      subjectAggregates: aggregatesBySubject
+      subjectAggregates: aggregatesBySubject,
+      rawTransactions: allTransactions
     });
     await db.update(analyses).set({
       status: "done",

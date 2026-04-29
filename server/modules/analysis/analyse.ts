@@ -4,7 +4,9 @@ import { analysisSchema, type AnalysisResult } from "./schema";
 import {
   formatAggregatesForPrompt,
   type SubjectAggregate,
+  type Tx,
 } from "../reinterpretation/apply";
+import { overrideAnalysisResult } from "../reinterpretation/override";
 
 const client = new Anthropic();
 
@@ -26,6 +28,10 @@ type AnalyseInput = {
   // these numbers ARE the source of truth for the listed subjects — the
   // LLM narrates around them, doesn't recompute.
   subjectAggregates?: Record<string, SubjectAggregate>;
+  // The flat transaction list used to compute the aggregates above. Passed
+  // through so the post-LLM override pass can derive months-covered etc.
+  // and overwrite structured fields with deterministic numbers.
+  rawTransactions?: Tx[];
 };
 
 type AnalyseOutput = {
@@ -73,7 +79,20 @@ export async function analyseStatements(input: AnalyseInput): Promise<AnalyseOut
 
   // Drop orphan annotations / unreferenced claims before handing back, so
   // every clickable phrase in the rendered prose has a body to display.
-  const result = sanitizeAnalysisResult(response.parsed_output) as AnalysisResult;
+  let result = sanitizeAnalysisResult(response.parsed_output) as AnalysisResult;
+
+  // Deterministic post-LLM override: when reinterpretation rules cover a
+  // category (income / spending / savings), overwrite the structured numeric
+  // fields with values computed from the aggregates. The LLM's prose stays;
+  // its monthlyAverage / sources / etc. don't get to fudge the truth.
+  if (input.subjectAggregates && input.rawTransactions) {
+    result = overrideAnalysisResult(
+      result,
+      input.subjectAggregates,
+      input.rawTransactions,
+    ) as AnalysisResult;
+  }
+
   return {
     result,
     usage: {

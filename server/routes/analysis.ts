@@ -13,6 +13,22 @@ import { applyReinterpretations, type Tx } from "../modules/reinterpretation/app
 const router = Router();
 router.use(isAuthenticated);
 
+// Most-recent analyses row regardless of status. Lets the work surface
+// (PictureDraft) detect "Ally is currently re-running" so it can show
+// AllyAtWork during a refresh kicked off from StepController, even when the
+// user's natural step is past the analyse pass. Returns null when there's
+// no in-flight work — caller falls back to /api/analysis/latest semantics.
+router.get("/api/analysis/in-progress", async (req, res) => {
+  const user = req.user as { id: string };
+  const [row] = await db
+    .select()
+    .from(analyses)
+    .where(and(eq(analyses.userId, user.id), eq(analyses.status, "analysing")))
+    .orderBy(desc(analyses.createdAt))
+    .limit(1);
+  res.json(row ?? null);
+});
+
 router.get("/api/analysis/latest", async (req, res) => {
   const user = req.user as { id: string };
   // Only return analyses that have actually finished — otherwise an
@@ -104,6 +120,7 @@ router.post("/api/analysis/run", async (req, res) => {
       model: prompt.model,
       statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
       subjectAggregates: aggregatesBySubject,
+      rawTransactions: allTransactions,
     });
 
     const [finished] = await db

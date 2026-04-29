@@ -1,4 +1,4 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { PaneHeader } from "@/components/layout/PaneHeader";
 import { UserAvatar, getInitials } from "@/components/layout/Avatars";
@@ -7,13 +7,18 @@ import { AllyAtWork, type AllyAtWorkMode } from "@/components/AllyAtWork";
 import { AnalysePeek } from "@/components/AnalysePeek";
 import { useAuth } from "@/hooks/useAuth";
 import { STEP_LABEL, STEP_STATUS_LINE } from "@/lib/canvasCopy";
-import type { SubStep } from "@shared/schema";
+import type { Analysis, SubStep } from "@shared/schema";
 
-// Phase 1, Analyse step. Renders AllyAtWork while the server's background
-// worker produces the first-take analysis.
+// Phase 1, Analyse step. Renders AllyAtWork while a fresh analysis is in
+// flight (kicked off by StepController, manual /refresh, or chat triggerRefresh).
 //
-// Peek mode: when navigated here while sub-step is elsewhere, render the
-// static historical recap (AnalysePeek) — never lie that work is in flight.
+// Peek mode: when navigated here while the user's natural sub-step is past
+// this step AND no analysis is currently in progress, render the static
+// historical recap (AnalysePeek) — never lie that work is in flight.
+//
+// In-progress trumps peek: if the in-progress poll finds an `analysing` row,
+// the work IS happening right now (e.g. user just clicked the StepController
+// CTA to re-read), so render AllyAtWork regardless of peek.
 export function PictureDraft({
   subStep,
   peek,
@@ -30,6 +35,15 @@ export function PictureDraft({
     mutationFn: () => apiRequest("POST", `/api/sub-step/${subStep.id}/retry`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/sub-step/current"] }),
   });
+
+  // Detect whether a fresh analysis is in flight. Polled every 2.5s while we
+  // think there might be one (and also after a brief delay so a kick-off
+  // initiated milliseconds earlier is visible immediately).
+  const inProgressQ = useQuery<Analysis | null>({
+    queryKey: ["/api/analysis/in-progress"],
+    refetchInterval: 2500,
+  });
+  const isWorking = !!inProgressQ.data;
 
   const mode: AllyAtWorkMode = subStep.errorMessage ? "hit_problem" : "working";
 
@@ -58,7 +72,7 @@ export function PictureDraft({
         statusLine={<span className="text-muted-foreground">{STEP_STATUS_LINE.picture.draft}</span>}
       />
       <div className="flex-1 min-h-0 overflow-auto shadow-[inset_0_0_0_4px_var(--color-muted)]">
-        {peek ? (
+        {peek && !isWorking ? (
           <AnalysePeek canvas="picture" onSeeResult={onBackToCurrent} />
         ) : (
           <AllyAtWork
@@ -74,7 +88,7 @@ export function PictureDraft({
       </div>
       <PhaseActionBar
         primary={
-          peek
+          peek && !isWorking
             ? { label: "Back to current →", onClick: onBackToCurrent ?? (() => {}) }
             : undefined
         }
