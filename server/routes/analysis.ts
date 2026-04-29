@@ -7,6 +7,8 @@ import { audit } from "../auditLog";
 import { getActivePrompt } from "../modules/prompts/getPrompt";
 import { analyseStatements } from "../modules/analysis/analyse";
 import { persistAnalysisClaims, refreshCanvas1Analysis } from "../modules/analysis/refresh";
+import { loadActiveRules } from "../modules/reinterpretation/load";
+import { applyReinterpretations, type Tx } from "../modules/reinterpretation/apply";
 
 const router = Router();
 router.use(isAuthenticated);
@@ -77,11 +79,31 @@ router.post("/api/analysis/run", async (req, res) => {
 
   audit({ req, action: "analysis.start", resourceType: "analysis", resourceId: String(created.id) });
 
+  // Reinterpretation rules → deterministic per-subject aggregates. Same
+  // pipeline as refreshCanvas1Analysis; both routes feed analyseStatements
+  // the authoritative numbers.
+  const rules = await loadActiveRules(user.id);
+  const allTransactions: Tx[] = [];
+  for (const s of sts) {
+    const ext = s.extractionResult as { transactions?: Tx[] } | null;
+    for (const t of ext?.transactions ?? []) {
+      allTransactions.push({
+        date: t.date,
+        description: t.description,
+        amount: t.amount,
+        direction: t.direction,
+        statementFile: s.filename,
+      });
+    }
+  }
+  const { aggregatesBySubject } = applyReinterpretations(allTransactions, rules);
+
   try {
     const { result, usage } = await analyseStatements({
       systemPrompt: prompt.content,
       model: prompt.model,
       statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
+      subjectAggregates: aggregatesBySubject,
     });
 
     const [finished] = await db

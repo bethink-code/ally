@@ -509,6 +509,71 @@ export const savePromptSchema = z.object({
   content: z.string().min(1),
 });
 
+// === Reinterpretations — user-stated rules for re-categorising raw transactions ===
+//
+// First-class primitive for "you misread my data; interpret it like this instead."
+// Distinct from claims/profile narratives because rules are STRUCTURED — the
+// analysis pipeline applies them deterministically before the LLM narrates.
+//
+// Same data + new rule → new picture. Append-only history; rules supersede
+// each other when refined. See server/modules/reinterpretation/{schema,apply}.ts
+// for the rule shape and the pure-function applier.
+export const reinterpretations = pgTable(
+  "reinterpretations",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull().references(() => users.id),
+
+    // What aspect of the picture this rule scopes to. Dotted path.
+    // Examples: income.salary | income.gift | income.investment |
+    //   spending.essentials | spending.family | savings.retirement |
+    //   savings.emergency | transfer.internal
+    // Subjects are loose strings — the analysis prompt owns the vocabulary;
+    // adding a new subject doesn't require a schema change.
+    subject: text("subject").notNull(),
+
+    // Does this rule add transactions to the subject's pool, or remove them?
+    effect: text("effect").notNull(), // "include" | "exclude"
+
+    // What predicate identifies matching transactions? Kind drives the shape
+    // of the predicate jsonb. Initial supported kinds:
+    //   credits_matching → { pattern: string, flags?: string }  (regex on description)
+    //   debits_matching  → { pattern: string, flags?: string }
+    //   amount_in_range  → { min?: number, max?: number, direction?: "credit"|"debit" }
+    //   date_in_range    → { from?: string, to?: string }       (YYYY-MM-DD)
+    // Adding a new kind = new branch in apply.ts; no migration needed.
+    predicateKind: text("predicate_kind").notNull(),
+    predicate: jsonb("predicate").notNull(),
+
+    // The user's words. Used for audit + Ally narration ("you said X, so we now
+    // categorise Y as salary"). Never empty.
+    rationale: text("rationale").notNull(),
+
+    // Where the rule came from.
+    //   user_correction → emitted by qa chat when user corrects an interpretation
+    //   ally_inference  → Ally proposed it from an internal pass (future)
+    //   admin           → direct seed via scripts (today's only path)
+    source: text("source").notNull().default("user_correction"),
+
+    // Optional pointer to the message that produced this rule, for audit.
+    // Untyped FK so the column can reference whichever message table the chat
+    // currently writes to.
+    sourceMessageId: integer("source_message_id"),
+
+    // Append-only history. Active rules feed the analysis. Refining a rule
+    // creates a new active row and supersedes the old one — no in-place edits.
+    status: text("status").notNull().default("active"), // active | superseded
+    supersededBy: integer("superseded_by"),
+    supersededAt: timestamp("superseded_at"),
+
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => [
+    index("idx_reinterpretations_user").on(t.userId),
+    index("idx_reinterpretations_user_active").on(t.userId, t.status),
+  ],
+);
+
 export const onboardSchema = z.object({
   firstName: z.string().min(1).max(80),
   lastName: z.string().max(80).optional(),
@@ -538,3 +603,4 @@ export type RecordNote = typeof recordNotes.$inferSelect;
 export type RecordNoteSegment = typeof recordNoteSegments.$inferSelect;
 export type RecordNoteRelation = typeof recordNoteRelations.$inferSelect;
 export type RecordSynthesisJob = typeof recordSynthesisJobs.$inferSelect;
+export type Reinterpretation = typeof reinterpretations.$inferSelect;

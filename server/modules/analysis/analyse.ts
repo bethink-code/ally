@@ -1,6 +1,10 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { analysisSchema, type AnalysisResult } from "./schema";
+import {
+  formatAggregatesForPrompt,
+  type SubjectAggregate,
+} from "../reinterpretation/apply";
 
 const client = new Anthropic();
 
@@ -17,6 +21,11 @@ type AnalyseInput = {
   // self-funding from my business").
   conversationProfile?: unknown;
   flaggedIssues?: unknown;
+  // Deterministic per-subject aggregates computed from raw transactions
+  // by applying the user's active reinterpretation rules. When present,
+  // these numbers ARE the source of truth for the listed subjects — the
+  // LLM narrates around them, doesn't recompute.
+  subjectAggregates?: Record<string, SubjectAggregate>;
 };
 
 type AnalyseOutput = {
@@ -30,7 +39,12 @@ type AnalyseOutput = {
 };
 
 export async function analyseStatements(input: AnalyseInput): Promise<AnalyseOutput> {
-  const body = buildUserMessage(input.statements, input.conversationProfile, input.flaggedIssues);
+  const body = buildUserMessage(
+    input.statements,
+    input.conversationProfile,
+    input.flaggedIssues,
+    input.subjectAggregates,
+  );
 
   const response = await client.messages.parse({
     model: input.model,
@@ -118,8 +132,21 @@ function buildUserMessage(
   statements: AnalyseInput["statements"],
   profile?: unknown,
   flaggedIssues?: unknown,
+  subjectAggregates?: Record<string, SubjectAggregate>,
 ): string {
   const header = `You are being given ${statements.length} extracted bank statements covering a period of months. Analyse the whole set together, not one at a time.\n\n`;
+
+  // Authoritative aggregates section. Comes BEFORE the raw statements so the
+  // LLM has the source-of-truth numbers in mind before it starts categorising.
+  // When the user has stated reinterpretation rules ("all Herbal Horse credits
+  // are my salary"), the apply pipeline has computed deterministic per-subject
+  // totals from the raw data — those totals override any reading the LLM
+  // would otherwise make.
+  const aggregatesSection =
+    subjectAggregates && Object.keys(subjectAggregates).length > 0
+      ? formatAggregatesForPrompt(subjectAggregates) + "\n\n"
+      : "";
+
   // Compact JSON (no pretty-print). Saves ~30% tokens — each statement's
   // transactions array is the bulk of the input.
   const body = statements
@@ -138,7 +165,7 @@ function buildUserMessage(
     return v != null;
   });
   const flagsArr = Array.isArray(flaggedIssues) ? (flaggedIssues as string[]) : [];
-  if (!hasProfile && flagsArr.length === 0) return header + body;
+  if (!hasProfile && flagsArr.length === 0) return aggregatesSection + header + body;
 
   const tail: string[] = ["", "## What the user has told us so far (incorporate this)"];
   if (hasProfile) {
@@ -149,7 +176,8 @@ function buildUserMessage(
   }
   tail.push(
     "",
-    "Treat these as authoritative corrections / context. They override any default reading of the raw transactions.",
+    "Treat these as authoritative corrections / context. They override any default reading of the raw transactions. " +
+      "If a reinterpretation aggregate above also covers this subject, use the aggregate's number — never re-derive it.",
   );
-  return header + body + "\n\n" + tail.join("\n");
+  return aggregatesSection + header + body + "\n\n" + tail.join("\n");
 }
