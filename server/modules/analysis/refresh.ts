@@ -3,6 +3,8 @@ import { db } from "../../db";
 import { analyses, analysisClaims, conversations, statements, subSteps } from "@shared/schema";
 import { getActivePrompt } from "../prompts/getPrompt";
 import { analyseStatements } from "./analyse";
+import { loadActiveRules } from "../reinterpretation/load";
+import { applyReinterpretations, type Tx } from "../reinterpretation/apply";
 
 /**
  * Kick off a fresh Phase 1 analyse pass for `userId`. Inserts an in-progress
@@ -40,6 +42,25 @@ export async function refreshCanvas1Analysis(
     })
     .returning();
 
+  // Load reinterpretation rules + flatten transactions across statements so
+  // we can compute deterministic per-subject aggregates BEFORE the LLM runs.
+  // The LLM then narrates around the aggregates rather than re-deriving them.
+  const rules = await loadActiveRules(userId);
+  const allTransactions: Tx[] = [];
+  for (const s of sts) {
+    const ext = s.extractionResult as { transactions?: Tx[] } | null;
+    for (const t of ext?.transactions ?? []) {
+      allTransactions.push({
+        date: t.date,
+        description: t.description,
+        amount: t.amount,
+        direction: t.direction,
+        statementFile: s.filename,
+      });
+    }
+  }
+  const { aggregatesBySubject } = applyReinterpretations(allTransactions, rules);
+
   void (async () => {
     try {
       const { result, usage } = await analyseStatements({
@@ -48,6 +69,8 @@ export async function refreshCanvas1Analysis(
         statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
         conversationProfile: conv?.profile ?? null,
         flaggedIssues: conv?.flaggedIssues ?? [],
+        subjectAggregates: aggregatesBySubject,
+        rawTransactions: allTransactions,
       });
       await db
         .update(analyses)

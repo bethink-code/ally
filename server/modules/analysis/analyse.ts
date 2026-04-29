@@ -1,6 +1,12 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { analysisSchema, type AnalysisResult } from "./schema";
+import {
+  formatAggregatesForPrompt,
+  type SubjectAggregate,
+  type Tx,
+} from "../reinterpretation/apply";
+import { overrideAnalysisResult } from "../reinterpretation/override";
 
 const client = new Anthropic();
 
@@ -17,6 +23,15 @@ type AnalyseInput = {
   // self-funding from my business").
   conversationProfile?: unknown;
   flaggedIssues?: unknown;
+  // Deterministic per-subject aggregates computed from raw transactions
+  // by applying the user's active reinterpretation rules. When present,
+  // these numbers ARE the source of truth for the listed subjects — the
+  // LLM narrates around them, doesn't recompute.
+  subjectAggregates?: Record<string, SubjectAggregate>;
+  // The flat transaction list used to compute the aggregates above. Passed
+  // through so the post-LLM override pass can derive months-covered etc.
+  // and overwrite structured fields with deterministic numbers.
+  rawTransactions?: Tx[];
 };
 
 type AnalyseOutput = {
@@ -30,7 +45,12 @@ type AnalyseOutput = {
 };
 
 export async function analyseStatements(input: AnalyseInput): Promise<AnalyseOutput> {
-  const body = buildUserMessage(input.statements, input.conversationProfile, input.flaggedIssues);
+  const body = buildUserMessage(
+    input.statements,
+    input.conversationProfile,
+    input.flaggedIssues,
+    input.subjectAggregates,
+  );
 
   const response = await client.messages.parse({
     model: input.model,
@@ -59,7 +79,20 @@ export async function analyseStatements(input: AnalyseInput): Promise<AnalyseOut
 
   // Drop orphan annotations / unreferenced claims before handing back, so
   // every clickable phrase in the rendered prose has a body to display.
-  const result = sanitizeAnalysisResult(response.parsed_output) as AnalysisResult;
+  let result = sanitizeAnalysisResult(response.parsed_output) as AnalysisResult;
+
+  // Deterministic post-LLM override: when reinterpretation rules cover a
+  // category (income / spending / savings), overwrite the structured numeric
+  // fields with values computed from the aggregates. The LLM's prose stays;
+  // its monthlyAverage / sources / etc. don't get to fudge the truth.
+  if (input.subjectAggregates && input.rawTransactions) {
+    result = overrideAnalysisResult(
+      result,
+      input.subjectAggregates,
+      input.rawTransactions,
+    ) as AnalysisResult;
+  }
+
   return {
     result,
     usage: {
@@ -118,8 +151,21 @@ function buildUserMessage(
   statements: AnalyseInput["statements"],
   profile?: unknown,
   flaggedIssues?: unknown,
+  subjectAggregates?: Record<string, SubjectAggregate>,
 ): string {
   const header = `You are being given ${statements.length} extracted bank statements covering a period of months. Analyse the whole set together, not one at a time.\n\n`;
+
+  // Authoritative aggregates section. Comes BEFORE the raw statements so the
+  // LLM has the source-of-truth numbers in mind before it starts categorising.
+  // When the user has stated reinterpretation rules ("all Herbal Horse credits
+  // are my salary"), the apply pipeline has computed deterministic per-subject
+  // totals from the raw data — those totals override any reading the LLM
+  // would otherwise make.
+  const aggregatesSection =
+    subjectAggregates && Object.keys(subjectAggregates).length > 0
+      ? formatAggregatesForPrompt(subjectAggregates) + "\n\n"
+      : "";
+
   // Compact JSON (no pretty-print). Saves ~30% tokens — each statement's
   // transactions array is the bulk of the input.
   const body = statements
@@ -138,7 +184,7 @@ function buildUserMessage(
     return v != null;
   });
   const flagsArr = Array.isArray(flaggedIssues) ? (flaggedIssues as string[]) : [];
-  if (!hasProfile && flagsArr.length === 0) return header + body;
+  if (!hasProfile && flagsArr.length === 0) return aggregatesSection + header + body;
 
   const tail: string[] = ["", "## What the user has told us so far (incorporate this)"];
   if (hasProfile) {
@@ -149,7 +195,8 @@ function buildUserMessage(
   }
   tail.push(
     "",
-    "Treat these as authoritative corrections / context. They override any default reading of the raw transactions.",
+    "Treat these as authoritative corrections / context. They override any default reading of the raw transactions. " +
+      "If a reinterpretation aggregate above also covers this subject, use the aggregate's number — never re-derive it.",
   );
-  return header + body + "\n\n" + tail.join("\n");
+  return aggregatesSection + header + body + "\n\n" + tail.join("\n");
 }

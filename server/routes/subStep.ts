@@ -18,6 +18,8 @@ import { isAuthenticated } from "../auth";
 import { audit } from "../auditLog";
 import { getActivePrompt } from "../modules/prompts/getPrompt";
 import { analyseStatements } from "../modules/analysis/analyse";
+import { loadActiveRules } from "../modules/reinterpretation/load";
+import { applyReinterpretations, type Tx } from "../modules/reinterpretation/apply";
 import { buildAnalysisDraft } from "../modules/analysisDraft/build";
 import type { QaProfile } from "../modules/qa/schema";
 import {
@@ -412,11 +414,32 @@ async function runPictureAnalyse(userId: string, subStepId: number): Promise<voi
     })
     .returning();
 
+  // Reinterpretation rules → deterministic per-subject aggregates. Same
+  // pipeline as /api/analysis/run + refreshCanvas1Analysis. See
+  // server/modules/reinterpretation/{schema,apply,load}.ts.
+  const rules = await loadActiveRules(userId);
+  const allTransactions: Tx[] = [];
+  for (const s of sts) {
+    const ext = s.extractionResult as { transactions?: Tx[] } | null;
+    for (const t of ext?.transactions ?? []) {
+      allTransactions.push({
+        date: t.date,
+        description: t.description,
+        amount: t.amount,
+        direction: t.direction,
+        statementFile: s.filename,
+      });
+    }
+  }
+  const { aggregatesBySubject } = applyReinterpretations(allTransactions, rules);
+
   try {
     const { result, usage } = await analyseStatements({
       systemPrompt: prompt.content,
       model: prompt.model,
       statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
+      subjectAggregates: aggregatesBySubject,
+      rawTransactions: allTransactions,
     });
 
     await db

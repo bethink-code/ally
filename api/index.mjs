@@ -43,6 +43,7 @@ __export(schema_exports, {
   recordNotes: () => recordNotes,
   recordSegments: () => recordSegments,
   recordSynthesisJobs: () => recordSynthesisJobs,
+  reinterpretations: () => reinterpretations,
   savePromptSchema: () => savePromptSchema,
   sessions: () => sessions,
   statements: () => statements,
@@ -510,6 +511,55 @@ var savePromptSchema = z.object({
   model: z.string().min(1),
   content: z.string().min(1)
 });
+var reinterpretations = pgTable(
+  "reinterpretations",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("user_id").notNull().references(() => users.id),
+    // What aspect of the picture this rule scopes to. Dotted path.
+    // Examples: income.salary | income.gift | income.investment |
+    //   spending.essentials | spending.family | savings.retirement |
+    //   savings.emergency | transfer.internal
+    // Subjects are loose strings — the analysis prompt owns the vocabulary;
+    // adding a new subject doesn't require a schema change.
+    subject: text("subject").notNull(),
+    // Does this rule add transactions to the subject's pool, or remove them?
+    effect: text("effect").notNull(),
+    // "include" | "exclude"
+    // What predicate identifies matching transactions? Kind drives the shape
+    // of the predicate jsonb. Initial supported kinds:
+    //   credits_matching → { pattern: string, flags?: string }  (regex on description)
+    //   debits_matching  → { pattern: string, flags?: string }
+    //   amount_in_range  → { min?: number, max?: number, direction?: "credit"|"debit" }
+    //   date_in_range    → { from?: string, to?: string }       (YYYY-MM-DD)
+    // Adding a new kind = new branch in apply.ts; no migration needed.
+    predicateKind: text("predicate_kind").notNull(),
+    predicate: jsonb("predicate").notNull(),
+    // The user's words. Used for audit + Ally narration ("you said X, so we now
+    // categorise Y as salary"). Never empty.
+    rationale: text("rationale").notNull(),
+    // Where the rule came from.
+    //   user_correction → emitted by qa chat when user corrects an interpretation
+    //   ally_inference  → Ally proposed it from an internal pass (future)
+    //   admin           → direct seed via scripts (today's only path)
+    source: text("source").notNull().default("user_correction"),
+    // Optional pointer to the message that produced this rule, for audit.
+    // Untyped FK so the column can reference whichever message table the chat
+    // currently writes to.
+    sourceMessageId: integer("source_message_id"),
+    // Append-only history. Active rules feed the analysis. Refining a rule
+    // creates a new active row and supersedes the old one — no in-place edits.
+    status: text("status").notNull().default("active"),
+    // active | superseded
+    supersededBy: integer("superseded_by"),
+    supersededAt: timestamp("superseded_at"),
+    createdAt: timestamp("created_at").notNull().defaultNow()
+  },
+  (t) => [
+    index("idx_reinterpretations_user").on(t.userId),
+    index("idx_reinterpretations_user_active").on(t.userId, t.status)
+  ]
+);
 var onboardSchema = z.object({
   firstName: z.string().min(1).max(80),
   lastName: z.string().max(80).optional(),
@@ -1041,7 +1091,7 @@ var prompts_default = router4;
 
 // server/routes/analysis.ts
 import { Router as Router5 } from "express";
-import { and as and5, desc as desc5, eq as eq8 } from "drizzle-orm";
+import { and as and6, desc as desc5, eq as eq9 } from "drizzle-orm";
 
 // server/modules/analysis/analyse.ts
 import Anthropic2 from "@anthropic-ai/sdk";
@@ -1121,10 +1171,234 @@ var analysisSchema = z4.object({
   notes: z4.string().optional().describe("Anything else worth flagging \u2014 unusual patterns, data quality caveats, etc.")
 });
 
+// server/modules/reinterpretation/apply.ts
+var SAMPLE_LIMIT = 8;
+function applyReinterpretations(transactions, rules) {
+  const rulesBySubject = /* @__PURE__ */ new Map();
+  for (const r of rules) {
+    const bucket = rulesBySubject.get(r.subject) ?? { includes: [], excludes: [] };
+    if (r.effect === "include") bucket.includes.push(r);
+    else bucket.excludes.push(r);
+    rulesBySubject.set(r.subject, bucket);
+  }
+  const categorised = transactions.map((t) => ({
+    ...t,
+    subjects: [],
+    appliedRuleIds: []
+  }));
+  for (const [subject, bucket] of rulesBySubject) {
+    for (const tx of categorised) {
+      const includeHit = bucket.includes.find((r) => matchesPredicate(tx, r));
+      if (!includeHit) continue;
+      const excludeHit = bucket.excludes.find((r) => matchesPredicate(tx, r));
+      if (excludeHit) continue;
+      tx.subjects.push(subject);
+      if (includeHit.id != null) tx.appliedRuleIds.push(includeHit.id);
+    }
+  }
+  const aggregatesBySubject = {};
+  for (const [subject, bucket] of rulesBySubject) {
+    const agg = {
+      subject,
+      totalCredits: 0,
+      totalDebits: 0,
+      netFlow: 0,
+      count: 0,
+      countCredits: 0,
+      countDebits: 0,
+      samples: [],
+      rationales: [...bucket.includes, ...bucket.excludes].map((r) => r.rationale)
+    };
+    for (const tx of categorised) {
+      if (!tx.subjects.includes(subject)) continue;
+      agg.count += 1;
+      if (tx.direction === "credit") {
+        agg.totalCredits += tx.amount;
+        agg.countCredits += 1;
+      } else {
+        agg.totalDebits += tx.amount;
+        agg.countDebits += 1;
+      }
+      if (agg.samples.length < SAMPLE_LIMIT) {
+        agg.samples.push({ date: tx.date, description: tx.description, amount: tx.amount, direction: tx.direction });
+      }
+    }
+    agg.netFlow = agg.totalCredits - agg.totalDebits;
+    aggregatesBySubject[subject] = agg;
+  }
+  return { categorised, aggregatesBySubject };
+}
+function matchesPredicate(tx, rule) {
+  switch (rule.predicateKind) {
+    case "credits_matching": {
+      if (tx.direction !== "credit") return false;
+      const flags = rule.predicate.flags ?? "i";
+      try {
+        return new RegExp(rule.predicate.pattern, flags).test(tx.description);
+      } catch {
+        return false;
+      }
+    }
+    case "debits_matching": {
+      if (tx.direction !== "debit") return false;
+      const flags = rule.predicate.flags ?? "i";
+      try {
+        return new RegExp(rule.predicate.pattern, flags).test(tx.description);
+      } catch {
+        return false;
+      }
+    }
+    case "amount_in_range": {
+      const { min, max, direction } = rule.predicate;
+      if (direction && tx.direction !== direction) return false;
+      if (min != null && tx.amount < min) return false;
+      if (max != null && tx.amount > max) return false;
+      return true;
+    }
+    case "date_in_range": {
+      const { from, to } = rule.predicate;
+      if (from && tx.date < from) return false;
+      if (to && tx.date > to) return false;
+      return true;
+    }
+  }
+}
+function formatAggregatesForPrompt(aggregates) {
+  const subjects = Object.values(aggregates).sort((a, b) => b.netFlow - a.netFlow || a.subject.localeCompare(b.subject));
+  if (subjects.length === 0) return "(no reinterpretation rules active)";
+  const lines = [
+    "## Authoritative subject aggregates (computed from raw transactions per active reinterpretation rules)",
+    "",
+    "These numbers are the source of truth for the listed subjects. Use them verbatim in the picture.",
+    "Don't recompute, don't average, don't round in ways that change the figure.",
+    ""
+  ];
+  for (const a of subjects) {
+    lines.push(`### ${a.subject}`);
+    lines.push(`- credits total: ${a.totalCredits.toFixed(2)} across ${a.countCredits} transaction(s)`);
+    if (a.countDebits > 0) {
+      lines.push(`- debits total: ${a.totalDebits.toFixed(2)} across ${a.countDebits} transaction(s)`);
+      lines.push(`- net flow: ${a.netFlow.toFixed(2)}`);
+    }
+    if (a.rationales.length > 0) {
+      lines.push(`- rationale(s):`);
+      for (const r of a.rationales) lines.push(`  - ${r}`);
+    }
+    if (a.samples.length > 0) {
+      lines.push(`- sample transactions (up to ${SAMPLE_LIMIT}):`);
+      for (const s of a.samples) {
+        lines.push(`  - ${s.date}  ${s.direction === "credit" ? "+" : "-"}${s.amount.toFixed(2)}  ${s.description}`);
+      }
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+// server/modules/reinterpretation/override.ts
+function overrideAnalysisResult(result, aggregates, transactions) {
+  if (!result || typeof result !== "object") return result;
+  const r = { ...result };
+  if (Object.keys(aggregates).length === 0) return r;
+  const months = monthsCovered(transactions);
+  if (months <= 0) return r;
+  const byCategory = {};
+  for (const a of Object.values(aggregates)) {
+    const cat = a.subject.split(".")[0];
+    (byCategory[cat] ??= []).push(a);
+  }
+  if (byCategory.income && byCategory.income.length > 0) {
+    r.income = applyIncomeOverride(r.income ?? {}, byCategory.income, months);
+  }
+  if (byCategory.spending && byCategory.spending.length > 0) {
+    r.spending = applySpendingOverride(r.spending ?? {}, byCategory.spending, months);
+  }
+  if (byCategory.savings && byCategory.savings.length > 0) {
+    r.savings = applySavingsOverride(r.savings ?? {}, byCategory.savings, months);
+  }
+  return r;
+}
+function applyIncomeOverride(income, aggs, months) {
+  const sources = aggs.map((a) => ({
+    description: deriveSourceDescription(a),
+    monthlyAverage: round(a.totalCredits / months),
+    frequency: deriveFrequency(a.countCredits, months)
+  }));
+  const totalMonthly = sources.reduce((sum, s) => sum + s.monthlyAverage, 0);
+  return {
+    ...income,
+    monthlyAverage: totalMonthly,
+    sources,
+    // Regularity: if any single subject has many fragments, flag as variable.
+    regularity: aggs.some((a) => a.countCredits > months * 2) ? "variable" : income.regularity ?? "steady"
+  };
+}
+function applySpendingOverride(spending, aggs, months) {
+  const ruledMonthly = aggs.reduce((sum, a) => sum + a.totalDebits / months, 0);
+  const otherMonthly = (spending.byCategory ?? []).reduce((sum, c) => sum + c.monthlyAverage, 0);
+  const totalMonthly = round(ruledMonthly + otherMonthly);
+  const ruledCategories = aggs.map((a) => {
+    const monthly = round(a.totalDebits / months);
+    return {
+      category: deriveSourceDescription(a),
+      monthlyAverage: monthly,
+      percentOfSpend: totalMonthly > 0 ? monthly / totalMonthly : 0,
+      examples: a.samples.slice(0, 5).map((t) => t.description)
+    };
+  });
+  const llmCategories = (spending.byCategory ?? []).map((c) => ({
+    ...c,
+    percentOfSpend: totalMonthly > 0 ? c.monthlyAverage / totalMonthly : c.percentOfSpend
+  }));
+  return {
+    ...spending,
+    monthlyAverage: totalMonthly,
+    byCategory: [...ruledCategories, ...llmCategories].sort((a, b) => b.monthlyAverage - a.monthlyAverage)
+  };
+}
+function applySavingsOverride(savings, aggs, months) {
+  const netMonthly = aggs.reduce((sum, a) => sum + a.netFlow / months, 0);
+  return {
+    ...savings,
+    monthlyAverageSaved: round(netMonthly)
+  };
+}
+function monthsCovered(transactions) {
+  if (transactions.length === 0) return 0;
+  const dates = transactions.map((t) => t.date).sort();
+  const first = new Date(dates[0]);
+  const last = new Date(dates[dates.length - 1]);
+  if (Number.isNaN(first.getTime()) || Number.isNaN(last.getTime())) return 0;
+  const months = (last.getFullYear() - first.getFullYear()) * 12 + (last.getMonth() - first.getMonth()) + 1;
+  return Math.max(months, 1);
+}
+function deriveSourceDescription(a) {
+  const rationale = a.rationales[0];
+  if (rationale && rationale.length > 0) {
+    return rationale.length <= 80 ? rationale : rationale.slice(0, 77) + "\u2026";
+  }
+  return a.subject;
+}
+function deriveFrequency(countCredits, months) {
+  if (months === 0) return "irregular";
+  const perMonth = countCredits / months;
+  if (perMonth > 2) return "fragmented (multiple deposits per month)";
+  if (perMonth > 0.8 && perMonth < 1.2) return "monthly";
+  return "irregular";
+}
+function round(n) {
+  return Math.round(n * 100) / 100;
+}
+
 // server/modules/analysis/analyse.ts
 var client2 = new Anthropic2();
 async function analyseStatements(input) {
-  const body = buildUserMessage(input.statements, input.conversationProfile, input.flaggedIssues);
+  const body = buildUserMessage(
+    input.statements,
+    input.conversationProfile,
+    input.flaggedIssues,
+    input.subjectAggregates
+  );
   const response = await client2.messages.parse({
     model: input.model,
     // Lowered from 16000 — observed outputs are ~3.5k tokens. The high
@@ -1148,7 +1422,14 @@ async function analyseStatements(input) {
   if (!response.parsed_output) {
     throw new Error("Analysis returned no parsed output");
   }
-  const result = sanitizeAnalysisResult(response.parsed_output);
+  let result = sanitizeAnalysisResult(response.parsed_output);
+  if (input.subjectAggregates && input.rawTransactions) {
+    result = overrideAnalysisResult(
+      result,
+      input.subjectAggregates,
+      input.rawTransactions
+    );
+  }
   return {
     result,
     usage: {
@@ -1183,10 +1464,11 @@ function sanitizeAnalysisResult(result) {
   };
   return sanitised;
 }
-function buildUserMessage(statements2, profile, flaggedIssues) {
+function buildUserMessage(statements2, profile, flaggedIssues, subjectAggregates) {
   const header = `You are being given ${statements2.length} extracted bank statements covering a period of months. Analyse the whole set together, not one at a time.
 
 `;
+  const aggregatesSection = subjectAggregates && Object.keys(subjectAggregates).length > 0 ? formatAggregatesForPrompt(subjectAggregates) + "\n\n" : "";
   const body = statements2.map((s, i) => `## Statement ${i + 1} \u2014 ${s.filename}
 \`\`\`json
 ${JSON.stringify(s.extraction)}
@@ -1199,7 +1481,7 @@ ${JSON.stringify(s.extraction)}
     return v != null;
   });
   const flagsArr = Array.isArray(flaggedIssues) ? flaggedIssues : [];
-  if (!hasProfile && flagsArr.length === 0) return header + body;
+  if (!hasProfile && flagsArr.length === 0) return aggregatesSection + header + body;
   const tail = ["", "## What the user has told us so far (incorporate this)"];
   if (hasProfile) {
     tail.push("```json", JSON.stringify(profileObj), "```");
@@ -1209,25 +1491,128 @@ ${JSON.stringify(s.extraction)}
   }
   tail.push(
     "",
-    "Treat these as authoritative corrections / context. They override any default reading of the raw transactions."
+    "Treat these as authoritative corrections / context. They override any default reading of the raw transactions. If a reinterpretation aggregate above also covers this subject, use the aggregate's number \u2014 never re-derive it."
   );
-  return header + body + "\n\n" + tail.join("\n");
+  return aggregatesSection + header + body + "\n\n" + tail.join("\n");
 }
 
 // server/modules/analysis/refresh.ts
-import { and as and4, eq as eq7, isNull } from "drizzle-orm";
+import { and as and5, eq as eq8, isNull } from "drizzle-orm";
+
+// server/modules/reinterpretation/load.ts
+import { and as and4, eq as eq7 } from "drizzle-orm";
+
+// server/modules/reinterpretation/schema.ts
+import { z as z5 } from "zod";
+var creditsMatchingSchema = z5.object({
+  pattern: z5.string().min(1).describe("Regex matched against transaction.description"),
+  flags: z5.string().optional().describe("Regex flags. Defaults to 'i' (case-insensitive).")
+});
+var debitsMatchingSchema = z5.object({
+  pattern: z5.string().min(1),
+  flags: z5.string().optional()
+});
+var amountInRangeSchema = z5.object({
+  min: z5.number().nonnegative().optional(),
+  max: z5.number().nonnegative().optional(),
+  direction: z5.enum(["credit", "debit"]).optional()
+});
+var dateInRangeSchema = z5.object({
+  from: z5.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z5.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+});
+var ruleSchema = z5.discriminatedUnion("predicateKind", [
+  z5.object({
+    id: z5.number().optional(),
+    subject: z5.string().min(1),
+    effect: z5.enum(["include", "exclude"]),
+    rationale: z5.string(),
+    predicateKind: z5.literal("credits_matching"),
+    predicate: creditsMatchingSchema
+  }),
+  z5.object({
+    id: z5.number().optional(),
+    subject: z5.string().min(1),
+    effect: z5.enum(["include", "exclude"]),
+    rationale: z5.string(),
+    predicateKind: z5.literal("debits_matching"),
+    predicate: debitsMatchingSchema
+  }),
+  z5.object({
+    id: z5.number().optional(),
+    subject: z5.string().min(1),
+    effect: z5.enum(["include", "exclude"]),
+    rationale: z5.string(),
+    predicateKind: z5.literal("amount_in_range"),
+    predicate: amountInRangeSchema
+  }),
+  z5.object({
+    id: z5.number().optional(),
+    subject: z5.string().min(1),
+    effect: z5.enum(["include", "exclude"]),
+    rationale: z5.string(),
+    predicateKind: z5.literal("date_in_range"),
+    predicate: dateInRangeSchema
+  })
+]);
+function parseRule(row) {
+  return ruleSchema.parse(row);
+}
+
+// server/modules/reinterpretation/load.ts
+async function loadActiveRules(userId) {
+  const rows = await db.select().from(reinterpretations).where(and4(eq7(reinterpretations.userId, userId), eq7(reinterpretations.status, "active"))).orderBy(reinterpretations.createdAt);
+  const out = [];
+  for (const row of rows) {
+    try {
+      out.push(
+        parseRule({
+          id: row.id,
+          subject: row.subject,
+          effect: row.effect,
+          rationale: row.rationale,
+          predicateKind: row.predicateKind,
+          predicate: row.predicate
+        })
+      );
+    } catch (err) {
+      console.warn(
+        `[reinterpretation] skip rule ${row.id} (${row.predicateKind}/${row.subject}): malformed predicate`,
+        err
+      );
+    }
+  }
+  return out;
+}
+
+// server/modules/analysis/refresh.ts
 async function refreshCanvas1Analysis(userId) {
-  const sts = await db.select().from(statements).where(and4(eq7(statements.userId, userId), eq7(statements.status, "extracted")));
+  const sts = await db.select().from(statements).where(and5(eq8(statements.userId, userId), eq8(statements.status, "extracted")));
   if (sts.length === 0) throw new Error("no_statements");
   const prompt = await getActivePrompt("analysis");
   if (!prompt) throw new Error("no_active_analysis_prompt");
-  const [conv] = await db.select().from(conversations).where(eq7(conversations.userId, userId)).limit(1);
+  const [conv] = await db.select().from(conversations).where(eq8(conversations.userId, userId)).limit(1);
   const [created] = await db.insert(analyses).values({
     userId,
     status: "analysing",
     promptVersionId: prompt.id,
     sourceStatementIds: sts.map((s) => s.id)
   }).returning();
+  const rules = await loadActiveRules(userId);
+  const allTransactions = [];
+  for (const s of sts) {
+    const ext = s.extractionResult;
+    for (const t of ext?.transactions ?? []) {
+      allTransactions.push({
+        date: t.date,
+        description: t.description,
+        amount: t.amount,
+        direction: t.direction,
+        statementFile: s.filename
+      });
+    }
+  }
+  const { aggregatesBySubject } = applyReinterpretations(allTransactions, rules);
   void (async () => {
     try {
       const { result, usage } = await analyseStatements({
@@ -1235,7 +1620,9 @@ async function refreshCanvas1Analysis(userId) {
         model: prompt.model,
         statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
         conversationProfile: conv?.profile ?? null,
-        flaggedIssues: conv?.flaggedIssues ?? []
+        flaggedIssues: conv?.flaggedIssues ?? [],
+        subjectAggregates: aggregatesBySubject,
+        rawTransactions: allTransactions
       });
       await db.update(analyses).set({
         status: "done",
@@ -1245,22 +1632,22 @@ async function refreshCanvas1Analysis(userId) {
         cacheReadTokens: usage.cacheReadTokens,
         cacheCreationTokens: usage.cacheCreationTokens,
         completedAt: /* @__PURE__ */ new Date()
-      }).where(eq7(analyses.id, created.id));
+      }).where(eq8(analyses.id, created.id));
       await persistAnalysisClaims(created.id, result);
       await db.update(subSteps).set({
         contentJson: { analysisId: created.id },
         updatedAt: /* @__PURE__ */ new Date()
       }).where(
-        and4(
-          eq7(subSteps.userId, userId),
-          eq7(subSteps.phaseKey, "picture"),
+        and5(
+          eq8(subSteps.userId, userId),
+          eq8(subSteps.phaseKey, "picture"),
           isNull(subSteps.supersededAt)
         )
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : "unknown_error";
       console.error("[refreshCanvas1Analysis] failed:", err);
-      await db.update(analyses).set({ status: "failed", errorMessage: message, completedAt: /* @__PURE__ */ new Date() }).where(eq7(analyses.id, created.id));
+      await db.update(analyses).set({ status: "failed", errorMessage: message, completedAt: /* @__PURE__ */ new Date() }).where(eq8(analyses.id, created.id));
     }
   })();
   return { analysisId: created.id, status: "analysing" };
@@ -1289,23 +1676,28 @@ async function persistAnalysisClaims(analysisId, result) {
 // server/routes/analysis.ts
 var router5 = Router5();
 router5.use(isAuthenticated);
+router5.get("/api/analysis/in-progress", async (req, res) => {
+  const user = req.user;
+  const [row] = await db.select().from(analyses).where(and6(eq9(analyses.userId, user.id), eq9(analyses.status, "analysing"))).orderBy(desc5(analyses.createdAt)).limit(1);
+  res.json(row ?? null);
+});
 router5.get("/api/analysis/latest", async (req, res) => {
   const user = req.user;
-  const [row] = await db.select().from(analyses).where(and5(eq8(analyses.userId, user.id), eq8(analyses.status, "done"))).orderBy(desc5(analyses.createdAt)).limit(1);
+  const [row] = await db.select().from(analyses).where(and6(eq9(analyses.userId, user.id), eq9(analyses.status, "done"))).orderBy(desc5(analyses.createdAt)).limit(1);
   res.json(row ?? null);
 });
 router5.get("/api/analysis/:id/claims", async (req, res) => {
   const user = req.user;
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
-  const [row] = await db.select().from(analyses).where(and5(eq8(analyses.id, id), eq8(analyses.userId, user.id))).limit(1);
+  const [row] = await db.select().from(analyses).where(and6(eq9(analyses.id, id), eq9(analyses.userId, user.id))).limit(1);
   if (!row) return res.status(404).json({ error: "not_found" });
-  const claims = await db.select().from(analysisClaims).where(eq8(analysisClaims.analysisId, id));
+  const claims = await db.select().from(analysisClaims).where(eq9(analysisClaims.analysisId, id));
   res.json(claims);
 });
 router5.post("/api/analysis/run", async (req, res) => {
   const user = req.user;
-  const sts = await db.select().from(statements).where(and5(eq8(statements.userId, user.id), eq8(statements.status, "extracted")));
+  const sts = await db.select().from(statements).where(and6(eq9(statements.userId, user.id), eq9(statements.status, "extracted")));
   if (sts.length === 0) {
     return res.status(400).json({ error: "no_statements" });
   }
@@ -1320,11 +1712,28 @@ router5.post("/api/analysis/run", async (req, res) => {
     sourceStatementIds: sts.map((s) => s.id)
   }).returning();
   audit({ req, action: "analysis.start", resourceType: "analysis", resourceId: String(created.id) });
+  const rules = await loadActiveRules(user.id);
+  const allTransactions = [];
+  for (const s of sts) {
+    const ext = s.extractionResult;
+    for (const t of ext?.transactions ?? []) {
+      allTransactions.push({
+        date: t.date,
+        description: t.description,
+        amount: t.amount,
+        direction: t.direction,
+        statementFile: s.filename
+      });
+    }
+  }
+  const { aggregatesBySubject } = applyReinterpretations(allTransactions, rules);
   try {
     const { result, usage } = await analyseStatements({
       systemPrompt: prompt.content,
       model: prompt.model,
-      statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult }))
+      statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
+      subjectAggregates: aggregatesBySubject,
+      rawTransactions: allTransactions
     });
     const [finished] = await db.update(analyses).set({
       status: "done",
@@ -1334,7 +1743,7 @@ router5.post("/api/analysis/run", async (req, res) => {
       cacheReadTokens: usage.cacheReadTokens,
       cacheCreationTokens: usage.cacheCreationTokens,
       completedAt: /* @__PURE__ */ new Date()
-    }).where(eq8(analyses.id, created.id)).returning();
+    }).where(eq9(analyses.id, created.id)).returning();
     await persistAnalysisClaims(created.id, result);
     audit({
       req,
@@ -1346,7 +1755,7 @@ router5.post("/api/analysis/run", async (req, res) => {
     res.json(finished);
   } catch (err) {
     const message = err instanceof Error ? err.message : "unknown_error";
-    await db.update(analyses).set({ status: "failed", errorMessage: message, completedAt: /* @__PURE__ */ new Date() }).where(eq8(analyses.id, created.id));
+    await db.update(analyses).set({ status: "failed", errorMessage: message, completedAt: /* @__PURE__ */ new Date() }).where(eq9(analyses.id, created.id));
     audit({
       req,
       action: "analysis.failure",
@@ -1373,51 +1782,51 @@ var analysis_default = router5;
 
 // server/routes/qa.ts
 import { Router as Router6 } from "express";
-import { z as z6 } from "zod";
-import { and as and10, asc as asc2, desc as desc9, eq as eq14 } from "drizzle-orm";
+import { z as z7 } from "zod";
+import { and as and11, asc as asc2, desc as desc9, eq as eq15 } from "drizzle-orm";
 
 // server/modules/qa/persistTurn.ts
-import { and as and9, eq as eq13 } from "drizzle-orm";
+import { and as and10, eq as eq14 } from "drizzle-orm";
 
 // server/modules/qa/chat.ts
 import Anthropic3 from "@anthropic-ai/sdk";
 import { zodOutputFormat as zodOutputFormat3 } from "@anthropic-ai/sdk/helpers/zod";
 
 // server/modules/qa/schema.ts
-import { z as z5 } from "zod/v4";
-var qaProfileSchema = z5.object({
-  corrections: z5.array(z5.string()).describe("Things the user said were wrong in their story. Short statements, one per correction."),
-  otherAccounts: z5.string().describe("Notes on accounts not visible in the uploaded statements (other banks, savings, investments, credit cards). Empty string if not yet discussed."),
-  incomeContext: z5.string().describe("Notes on income stability, source concentration, side income. Empty string if not yet discussed."),
-  debt: z5.string().describe("Notes on debts not visible in statements (store accounts, family loans, other bank credit cards). Empty string if not yet discussed."),
-  medicalCover: z5.string().describe("Notes on medical aid / hospital cover status. Empty string if not yet discussed."),
-  lifeCover: z5.string().describe("Notes on life cover and who depends on the user's income. Empty string if not yet discussed."),
-  incomeProtection: z5.string().describe("Notes on income protection cover. Empty string if not yet discussed."),
-  retirement: z5.string().describe("Notes on retirement savings \u2014 RA, employer fund, provident fund, etc. Empty string if not yet discussed."),
-  tax: z5.string().describe("Notes on tax situation \u2014 PAYE, provisional, VAT, company salary. Empty string if not yet discussed."),
-  property: z5.string().describe("Notes on property ownership, bonds, rental. Empty string if not yet discussed."),
-  goals: z5.array(z5.string()).describe("What the user wants \u2014 VERBATIM in their own words. Do not reword into financial jargon."),
-  lifeContext: z5.string().describe("Notes on dependents, partner, living situation, life stage. Empty string if not yet discussed."),
-  will: z5.string().describe("Notes on will / estate planning. Empty string if not yet discussed.")
+import { z as z6 } from "zod/v4";
+var qaProfileSchema = z6.object({
+  corrections: z6.array(z6.string()).describe("Things the user said were wrong in their story. Short statements, one per correction."),
+  otherAccounts: z6.string().describe("Notes on accounts not visible in the uploaded statements (other banks, savings, investments, credit cards). Empty string if not yet discussed."),
+  incomeContext: z6.string().describe("Notes on income stability, source concentration, side income. Empty string if not yet discussed."),
+  debt: z6.string().describe("Notes on debts not visible in statements (store accounts, family loans, other bank credit cards). Empty string if not yet discussed."),
+  medicalCover: z6.string().describe("Notes on medical aid / hospital cover status. Empty string if not yet discussed."),
+  lifeCover: z6.string().describe("Notes on life cover and who depends on the user's income. Empty string if not yet discussed."),
+  incomeProtection: z6.string().describe("Notes on income protection cover. Empty string if not yet discussed."),
+  retirement: z6.string().describe("Notes on retirement savings \u2014 RA, employer fund, provident fund, etc. Empty string if not yet discussed."),
+  tax: z6.string().describe("Notes on tax situation \u2014 PAYE, provisional, VAT, company salary. Empty string if not yet discussed."),
+  property: z6.string().describe("Notes on property ownership, bonds, rental. Empty string if not yet discussed."),
+  goals: z6.array(z6.string()).describe("What the user wants \u2014 VERBATIM in their own words. Do not reword into financial jargon."),
+  lifeContext: z6.string().describe("Notes on dependents, partner, living situation, life stage. Empty string if not yet discussed."),
+  will: z6.string().describe("Notes on will / estate planning. Empty string if not yet discussed.")
 });
 var qaProfileUpdateSchema = qaProfileSchema;
-var qaTurnResultSchema = z5.object({
-  reply: z5.string().describe(
+var qaTurnResultSchema = z6.object({
+  reply: z6.string().describe(
     "What to say back to the user. Short \u2014 a few sentences, never a wall of text. No formatting (no bullets, bold, headers, lists). Conversational. One question at a time, never two."
   ),
   profileUpdates: qaProfileUpdateSchema.describe(
     "Your full current view of the profile. For topics you didn't address this turn, pass an empty string (or empty array for corrections/goals). The server merges: non-empty strings overwrite existing notes, arrays are appended and deduped."
   ),
-  newFlaggedIssues: z5.array(z5.string()).describe(
+  newFlaggedIssues: z6.array(z6.string()).describe(
     "NEW key issues to flag from what the user just said. One short sentence each. Do not repeat previously flagged issues. Empty array if nothing new to flag."
   ),
-  status: z5.enum(["continuing", "minimum_viable", "complete"]).describe(
+  status: z6.enum(["continuing", "minimum_viable", "complete"]).describe(
     "continuing = more to gather; minimum_viable = enough for a picture but could gather more; complete = nothing essential left to gather."
   ),
-  triggerRefresh: z5.boolean().default(false).describe(
+  triggerRefresh: z6.boolean().default(false).describe(
     "Set true when the user has just made a substantive correction to a fact that the rendered analysis depends on (e.g. 'that's not salary, it's self-funding from my business'; 'my real income is R30k, not R10k'; 'please update the picture based on what I just told you'). When true, the server kicks off a fresh analysis with the updated profile in context, and the rendered story re-renders. Set FALSE for soft acknowledgements, clarifying questions, and small chat updates that don't change the analysis."
   ),
-  regenerateReason: z5.string().optional().describe(
+  regenerateReason: z6.string().optional().describe(
     "When triggerRefresh=true, a one-sentence summary of what the user corrected \u2014 the next analysis pass uses this as a hint. e.g. 'User corrected income: actual salary is R30k/month from The Herbal Horse, fragmented across multiple deposits.'"
   )
 });
@@ -1608,12 +2017,12 @@ function concatDedup(existing, incoming) {
 }
 
 // server/modules/stateChange/handlers.ts
-import { eq as eq12 } from "drizzle-orm";
+import { eq as eq13 } from "drizzle-orm";
 
 // server/modules/record/index.ts
-import { and as and6, asc, desc as desc6, eq as eq9, isNull as isNull2, or } from "drizzle-orm";
+import { and as and7, asc, desc as desc6, eq as eq10, isNull as isNull2, or } from "drizzle-orm";
 async function ensureRecord(userId) {
-  const [existing] = await db.select().from(record).where(eq9(record.userId, userId)).limit(1);
+  const [existing] = await db.select().from(record).where(eq10(record.userId, userId)).limit(1);
   if (existing) {
     const attrs = existing.attributes ?? {};
     if (!attrs.migratedFromLegacy) {
@@ -1621,7 +2030,7 @@ async function ensureRecord(userId) {
       await db.update(record).set({
         attributes: { ...attrs, migratedFromLegacy: true },
         updatedAt: /* @__PURE__ */ new Date()
-      }).where(eq9(record.id, existing.id));
+      }).where(eq10(record.id, existing.id));
     }
     return existing;
   }
@@ -1630,11 +2039,11 @@ async function ensureRecord(userId) {
   await db.update(record).set({
     attributes: { migratedFromLegacy: true },
     updatedAt: /* @__PURE__ */ new Date()
-  }).where(eq9(record.id, created.id));
+  }).where(eq10(record.id, created.id));
   return created;
 }
 async function lazyBackfillFromLegacy(userId, recordId) {
-  const [conv] = await db.select().from(conversations).where(eq9(conversations.userId, userId)).limit(1);
+  const [conv] = await db.select().from(conversations).where(eq10(conversations.userId, userId)).limit(1);
   if (conv) {
     const profile = conv.profile ?? {};
     for (const [key, value] of Object.entries(profile)) {
@@ -1666,9 +2075,9 @@ async function lazyBackfillFromLegacy(userId, recordId) {
       });
     }
   }
-  const [draft] = await db.select().from(analysisDrafts).where(and6(eq9(analysisDrafts.userId, userId), isNull2(analysisDrafts.supersededAt))).orderBy(desc6(analysisDrafts.createdAt)).limit(1);
+  const [draft] = await db.select().from(analysisDrafts).where(and7(eq10(analysisDrafts.userId, userId), isNull2(analysisDrafts.supersededAt))).orderBy(desc6(analysisDrafts.createdAt)).limit(1);
   if (draft) {
-    const claims = await db.select().from(analysisClaims).where(eq9(analysisClaims.draftId, draft.id));
+    const claims = await db.select().from(analysisClaims).where(eq10(analysisClaims.draftId, draft.id));
     for (const c of claims) {
       await db.insert(recordNotes).values({
         recordId,
@@ -1717,39 +2126,39 @@ async function supersedeNote(userId, oldNoteId, replacement) {
     supersededAt: /* @__PURE__ */ new Date(),
     supersededBy: replacementNote.id,
     updatedAt: /* @__PURE__ */ new Date()
-  }).where(and6(eq9(recordNotes.id, oldNoteId), eq9(recordNotes.userId, userId)));
+  }).where(and7(eq10(recordNotes.id, oldNoteId), eq10(recordNotes.userId, userId)));
   return replacementNote;
 }
 async function softDeleteNote(userId, noteId) {
-  await db.update(recordNotes).set({ status: "deletion_pending", updatedAt: /* @__PURE__ */ new Date() }).where(and6(eq9(recordNotes.id, noteId), eq9(recordNotes.userId, userId)));
+  await db.update(recordNotes).set({ status: "deletion_pending", updatedAt: /* @__PURE__ */ new Date() }).where(and7(eq10(recordNotes.id, noteId), eq10(recordNotes.userId, userId)));
 }
 async function listNotes(filter) {
   await ensureRecord(filter.userId);
-  const statusClause = filter.includeDeletionPending ? or(eq9(recordNotes.status, "active"), eq9(recordNotes.status, "declined")) : eq9(recordNotes.status, "active");
+  const statusClause = filter.includeDeletionPending ? or(eq10(recordNotes.status, "active"), eq10(recordNotes.status, "declined")) : eq10(recordNotes.status, "active");
   if (filter.segmentId != null) {
-    const rows = await db.select({ note: recordNotes }).from(recordNoteSegments).innerJoin(recordNotes, eq9(recordNotes.id, recordNoteSegments.noteId)).where(
-      and6(
-        eq9(recordNoteSegments.segmentId, filter.segmentId),
-        eq9(recordNotes.userId, filter.userId),
+    const rows = await db.select({ note: recordNotes }).from(recordNoteSegments).innerJoin(recordNotes, eq10(recordNotes.id, recordNoteSegments.noteId)).where(
+      and7(
+        eq10(recordNoteSegments.segmentId, filter.segmentId),
+        eq10(recordNotes.userId, filter.userId),
         statusClause,
-        filter.category ? eq9(recordNotes.category, filter.category) : void 0,
-        filter.kind ? eq9(recordNotes.kind, filter.kind) : void 0
+        filter.category ? eq10(recordNotes.category, filter.category) : void 0,
+        filter.kind ? eq10(recordNotes.kind, filter.kind) : void 0
       )
     ).orderBy(desc6(recordNotes.establishedAt)).limit(filter.limit ?? 200);
     return rows.map((r) => r.note);
   }
   return db.select().from(recordNotes).where(
-    and6(
-      eq9(recordNotes.userId, filter.userId),
+    and7(
+      eq10(recordNotes.userId, filter.userId),
       statusClause,
-      filter.category ? eq9(recordNotes.category, filter.category) : void 0,
-      filter.kind ? eq9(recordNotes.kind, filter.kind) : void 0
+      filter.category ? eq10(recordNotes.category, filter.category) : void 0,
+      filter.kind ? eq10(recordNotes.kind, filter.kind) : void 0
     )
   ).orderBy(desc6(recordNotes.establishedAt)).limit(filter.limit ?? 200);
 }
 async function listSegments(userId) {
   await ensureRecord(userId);
-  return db.select().from(recordSegments).where(eq9(recordSegments.userId, userId)).orderBy(asc(recordSegments.startedAt));
+  return db.select().from(recordSegments).where(eq10(recordSegments.userId, userId)).orderBy(asc(recordSegments.startedAt));
 }
 async function triggerMetaSynthesis(userId, trigger, context) {
   await ensureRecord(userId);
@@ -1767,7 +2176,7 @@ function humanise(key) {
 }
 
 // server/modules/checklist/derive.ts
-import { and as and7, desc as desc7, eq as eq10 } from "drizzle-orm";
+import { and as and8, desc as desc7, eq as eq11 } from "drizzle-orm";
 var PICTURE_FIELDS = [
   { key: "retirement", label: "Retirement", importance: "core" },
   { key: "debt", label: "Debt", importance: "core" },
@@ -1795,9 +2204,9 @@ async function deriveChecklist(userId, subStep) {
   return { canvas: subStep.phaseKey, step: subStep.step, items: [], agreementReady: true };
 }
 async function derivePictureChecklist(userId, subStep) {
-  const [conv] = await db.select().from(conversations).where(eq10(conversations.userId, userId)).limit(1);
+  const [conv] = await db.select().from(conversations).where(eq11(conversations.userId, userId)).limit(1);
   const profile = conv?.profile ?? emptyProfile();
-  const skipped = await db.select().from(recordNotes).where(and7(eq10(recordNotes.userId, userId), eq10(recordNotes.kind, "skipped_gap")));
+  const skipped = await db.select().from(recordNotes).where(and8(eq11(recordNotes.userId, userId), eq11(recordNotes.kind, "skipped_gap")));
   const skippedByCategory = /* @__PURE__ */ new Map();
   for (const n of skipped) {
     if (n.category) skippedByCategory.set(n.category, n.body);
@@ -1834,20 +2243,20 @@ async function deriveAnalysisChecklist(userId, subStep) {
   if (!content.draftId) {
     return { canvas: "analysis", step: "discuss", items: [], agreementReady: false };
   }
-  const [draft] = await db.select().from(analysisDrafts).where(eq10(analysisDrafts.id, content.draftId)).limit(1);
+  const [draft] = await db.select().from(analysisDrafts).where(eq11(analysisDrafts.id, content.draftId)).limit(1);
   if (!draft) {
     return { canvas: "analysis", step: "discuss", items: [], agreementReady: false };
   }
   const prose = draft.prose ?? {};
   const sections = prose.sections ?? [];
-  const [conv] = await db.select().from(analysisConversations).where(eq10(analysisConversations.draftId, draft.id)).orderBy(desc7(analysisConversations.startedAt)).limit(1);
+  const [conv] = await db.select().from(analysisConversations).where(eq11(analysisConversations.draftId, draft.id)).orderBy(desc7(analysisConversations.startedAt)).limit(1);
   const userTurnCount = conv ? (await db.select().from(analysisConversationMessages).where(
-    and7(
-      eq10(analysisConversationMessages.analysisConversationId, conv.id),
-      eq10(analysisConversationMessages.role, "user")
+    and8(
+      eq11(analysisConversationMessages.analysisConversationId, conv.id),
+      eq11(analysisConversationMessages.role, "user")
     )
   )).length : 0;
-  const skipped = await db.select().from(recordNotes).where(and7(eq10(recordNotes.userId, userId), eq10(recordNotes.kind, "skipped_gap")));
+  const skipped = await db.select().from(recordNotes).where(and8(eq11(recordNotes.userId, userId), eq11(recordNotes.kind, "skipped_gap")));
   const skippedByCategory = /* @__PURE__ */ new Map();
   for (const n of skipped) {
     if (n.category) skippedByCategory.set(n.category, n.body);
@@ -1873,7 +2282,7 @@ function humaniseSectionId(s) {
 }
 
 // server/modules/stateChange/messages.ts
-import { desc as desc8, eq as eq11 } from "drizzle-orm";
+import { desc as desc8, eq as eq12 } from "drizzle-orm";
 var OPENERS = {
   picture_live: "Done. That's your picture, agreed. I'll be here if anything changes \u2014 just shout.",
   analysis_live: "Agreed. That's your analysis on the record. I'm here if you want to come back to it.",
@@ -1900,7 +2309,7 @@ var TOPIC_STARTERS = {
 };
 async function postAllyMessage(input) {
   if (input.canvas === "picture") {
-    const [conv] = await db.select().from(conversations).where(eq11(conversations.userId, input.userId)).limit(1);
+    const [conv] = await db.select().from(conversations).where(eq12(conversations.userId, input.userId)).limit(1);
     if (!conv) return null;
     const [msg] = await db.insert(conversationMessages).values({
       conversationId: conv.id,
@@ -1911,7 +2320,7 @@ async function postAllyMessage(input) {
     return msg.id;
   }
   if (input.canvas === "analysis") {
-    const [conv] = await db.select().from(analysisConversations).where(eq11(analysisConversations.userId, input.userId)).orderBy(desc8(analysisConversations.startedAt)).limit(1);
+    const [conv] = await db.select().from(analysisConversations).where(eq12(analysisConversations.userId, input.userId)).orderBy(desc8(analysisConversations.startedAt)).limit(1);
     if (!conv) return null;
     const [msg] = await db.insert(analysisConversationMessages).values({
       analysisConversationId: conv.id,
@@ -2083,7 +2492,7 @@ ${opener ?? ""}`.trim() : opener;
 async function buildAgreementRecap(ctx) {
   if (!ctx.subStepId) return null;
   try {
-    const [sub] = await db.select().from(subSteps).where(eq12(subSteps.id, ctx.subStepId)).limit(1);
+    const [sub] = await db.select().from(subSteps).where(eq13(subSteps.id, ctx.subStepId)).limit(1);
     if (!sub) return null;
     const checklist = await deriveChecklist(ctx.userId, sub);
     const covered = checklist.items.filter((i) => i.status === "covered");
@@ -2200,7 +2609,7 @@ async function runAndPersistTurn(input) {
     status: newStatus,
     updatedAt: /* @__PURE__ */ new Date(),
     completedAt: newStatus === "complete" ? /* @__PURE__ */ new Date() : null
-  }).where(and9(eq13(conversations.id, input.conversationId), eq13(conversations.userId, input.userId))).returning();
+  }).where(and10(eq14(conversations.id, input.conversationId), eq14(conversations.userId, input.userId))).returning();
   const deltas = diffProfile(input.profile, mergedProfile);
   const newFlags = mergedFlags.filter((f) => !input.flaggedIssues.includes(f));
   if (Object.keys(deltas).length > 0 || newFlags.length > 0) {
@@ -2287,23 +2696,23 @@ function detailsFor(rows) {
 }
 var router6 = Router6();
 router6.use(isAuthenticated);
-var messageBodySchema = z6.object({
-  content: z6.string().min(1).max(5e3)
+var messageBodySchema = z7.object({
+  content: z7.string().min(1).max(5e3)
 });
 var MAX_HISTORY_MESSAGES = 6;
 router6.get("/api/qa/conversation", async (req, res) => {
   const user = req.user;
-  const [conversation] = await db.select().from(conversations).where(eq14(conversations.userId, user.id)).limit(1);
+  const [conversation] = await db.select().from(conversations).where(eq15(conversations.userId, user.id)).limit(1);
   if (!conversation) {
     return res.json({ conversation: null, messages: [] });
   }
-  const [latestAnalysis] = await db.select().from(analyses).where(and10(eq14(analyses.userId, user.id), eq14(analyses.status, "done"))).orderBy(desc9(analyses.createdAt)).limit(1);
+  const [latestAnalysis] = await db.select().from(analyses).where(and11(eq15(analyses.userId, user.id), eq15(analyses.status, "done"))).orderBy(desc9(analyses.createdAt)).limit(1);
   const currentPhase = derivePhase(user.buildCompletedAt, latestAnalysis?.result);
   const needsTransitionOpener = currentPhase === "first_take_gaps" && latestAnalysis?.id !== void 0 && latestAnalysis.id !== conversation.analysisIdAtStart;
   if (needsTransitionOpener && latestAnalysis?.result) {
     const prompt = await getActivePrompt("qa");
     if (prompt) {
-      const userStatements = await db.select().from(statements).where(eq14(statements.userId, user.id));
+      const userStatements = await db.select().from(statements).where(eq15(statements.userId, user.id));
       const runningProfile = conversation.profile ?? emptyProfile();
       const runningFlags = conversation.flaggedIssues ?? [];
       try {
@@ -2323,7 +2732,7 @@ router6.get("/api/qa/conversation", async (req, res) => {
           latestUser: null,
           isTransition: true
         });
-        await db.update(conversations).set({ analysisIdAtStart: latestAnalysis.id, updatedAt: /* @__PURE__ */ new Date() }).where(eq14(conversations.id, conversation.id));
+        await db.update(conversations).set({ analysisIdAtStart: latestAnalysis.id, updatedAt: /* @__PURE__ */ new Date() }).where(eq15(conversations.id, conversation.id));
         audit({
           req,
           action: "qa.phase_transition_opener",
@@ -2336,7 +2745,7 @@ router6.get("/api/qa/conversation", async (req, res) => {
       }
     }
   }
-  const [latestMsg] = await db.select({ createdAt: conversationMessages.createdAt }).from(conversationMessages).where(eq14(conversationMessages.conversationId, conversation.id)).orderBy(desc9(conversationMessages.createdAt)).limit(1);
+  const [latestMsg] = await db.select({ createdAt: conversationMessages.createdAt }).from(conversationMessages).where(eq15(conversationMessages.conversationId, conversation.id)).orderBy(desc9(conversationMessages.createdAt)).limit(1);
   if (conversation.status === "active" && isStale(latestMsg?.createdAt ?? null)) {
     await onStateChange({
       userId: user.id,
@@ -2345,21 +2754,21 @@ router6.get("/api/qa/conversation", async (req, res) => {
       payload: { canvas: "picture", step: "discuss" }
     });
   }
-  const [refreshed] = await db.select().from(conversations).where(eq14(conversations.id, conversation.id)).limit(1);
+  const [refreshed] = await db.select().from(conversations).where(eq15(conversations.id, conversation.id)).limit(1);
   const messages = await loadMessages(conversation.id);
   res.json({ conversation: refreshed ?? conversation, messages });
 });
 router6.post("/api/qa/start", async (req, res) => {
   const user = req.user;
-  const [existing] = await db.select().from(conversations).where(eq14(conversations.userId, user.id)).limit(1);
+  const [existing] = await db.select().from(conversations).where(eq15(conversations.userId, user.id)).limit(1);
   if (existing) {
     const existingMessages = await loadMessages(existing.id);
     if (existingMessages.length > 0) {
       return res.json({ conversation: existing, messages: existingMessages });
     }
   }
-  const [latestAnalysis] = await db.select().from(analyses).where(and10(eq14(analyses.userId, user.id), eq14(analyses.status, "done"))).orderBy(desc9(analyses.createdAt)).limit(1);
-  const userStatements = await db.select().from(statements).where(eq14(statements.userId, user.id));
+  const [latestAnalysis] = await db.select().from(analyses).where(and11(eq15(analyses.userId, user.id), eq15(analyses.status, "done"))).orderBy(desc9(analyses.createdAt)).limit(1);
+  const userStatements = await db.select().from(statements).where(eq15(statements.userId, user.id));
   const phase = derivePhase(user.buildCompletedAt, latestAnalysis?.result);
   const promptKey = phase === "first_take_gaps" ? "qa" : "qa_bring_it_in";
   const prompt = await getActivePrompt(promptKey);
@@ -2419,15 +2828,15 @@ router6.post("/api/qa/message", async (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: "invalid_input", detail: parsed.error.flatten() });
   }
-  const [conversation] = await db.select().from(conversations).where(eq14(conversations.userId, user.id)).limit(1);
+  const [conversation] = await db.select().from(conversations).where(eq15(conversations.userId, user.id)).limit(1);
   if (!conversation) {
     return res.status(404).json({ error: "no_conversation" });
   }
   if (conversation.status === "complete") {
     return res.status(400).json({ error: "conversation_complete" });
   }
-  const [latestAnalysis] = await db.select().from(analyses).where(and10(eq14(analyses.userId, user.id), eq14(analyses.status, "done"))).orderBy(desc9(analyses.createdAt)).limit(1);
-  const userStatements = await db.select().from(statements).where(eq14(statements.userId, user.id));
+  const [latestAnalysis] = await db.select().from(analyses).where(and11(eq15(analyses.userId, user.id), eq15(analyses.status, "done"))).orderBy(desc9(analyses.createdAt)).limit(1);
+  const userStatements = await db.select().from(statements).where(eq15(statements.userId, user.id));
   const phase = derivePhase(user.buildCompletedAt, latestAnalysis?.result);
   const promptKey = phase === "first_take_gaps" ? "qa" : "qa_bring_it_in";
   const prompt = await getActivePrompt(promptKey);
@@ -2492,7 +2901,7 @@ router6.post("/api/qa/message", async (req, res) => {
 });
 router6.post("/api/qa/pause", async (req, res) => {
   const user = req.user;
-  const [updated] = await db.update(conversations).set({ status: "paused", updatedAt: /* @__PURE__ */ new Date() }).where(and10(eq14(conversations.userId, user.id), eq14(conversations.status, "active"))).returning();
+  const [updated] = await db.update(conversations).set({ status: "paused", updatedAt: /* @__PURE__ */ new Date() }).where(and11(eq15(conversations.userId, user.id), eq15(conversations.status, "active"))).returning();
   if (!updated) {
     return res.status(404).json({ error: "no_active_conversation" });
   }
@@ -2506,7 +2915,7 @@ router6.post("/api/qa/pause", async (req, res) => {
 });
 router6.post("/api/qa/complete", async (req, res) => {
   const user = req.user;
-  const [updated] = await db.update(conversations).set({ status: "complete", completedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq14(conversations.userId, user.id)).returning();
+  const [updated] = await db.update(conversations).set({ status: "complete", completedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq15(conversations.userId, user.id)).returning();
   if (!updated) {
     return res.status(404).json({ error: "no_conversation" });
   }
@@ -2520,13 +2929,13 @@ router6.post("/api/qa/complete", async (req, res) => {
   res.json(updated);
 });
 async function loadMessages(conversationId) {
-  return db.select().from(conversationMessages).where(eq14(conversationMessages.conversationId, conversationId)).orderBy(asc2(conversationMessages.createdAt), asc2(conversationMessages.id));
+  return db.select().from(conversationMessages).where(eq15(conversationMessages.conversationId, conversationId)).orderBy(asc2(conversationMessages.createdAt), asc2(conversationMessages.id));
 }
 var qa_default = router6;
 
 // server/routes/analysisDraft.ts
 import { Router as Router7 } from "express";
-import { and as and12, desc as desc11, eq as eq16, isNull as isNull4 } from "drizzle-orm";
+import { and as and13, desc as desc11, eq as eq17, isNull as isNull4 } from "drizzle-orm";
 
 // server/modules/analysisDraft/claude.ts
 import Anthropic4 from "@anthropic-ai/sdk";
@@ -2579,66 +2988,66 @@ function sumUsage(usages) {
 }
 
 // server/modules/analysisDraft/schema.ts
-import { z as z7 } from "zod/v4";
-var evidenceRefSchema = z7.object({
-  kind: z7.string().describe("Source kind. Canonical values: 'transaction' | 'profile' | 'analysis' | 'conversation' | 'statement'. Loose enum \u2014 Anthropic's structured output occasionally emits adjacent values (e.g. 'fact', 'summary') and a strict enum kills the whole pipeline; downstream code treats kind as a hint, not a hard contract."),
-  ref: z7.string().describe("Opaque identifier \u2014 transaction id, profile path like 'family.dependents', statement id, etc.")
+import { z as z8 } from "zod/v4";
+var evidenceRefSchema = z8.object({
+  kind: z8.string().describe("Source kind. Canonical values: 'transaction' | 'profile' | 'analysis' | 'conversation' | 'statement'. Loose enum \u2014 Anthropic's structured output occasionally emits adjacent values (e.g. 'fact', 'summary') and a strict enum kills the whole pipeline; downstream code treats kind as a hint, not a hard contract."),
+  ref: z8.string().describe("Opaque identifier \u2014 transaction id, profile path like 'family.dependents', statement id, etc.")
 });
-var keyFactSchema = z7.object({
-  statement: z7.string().describe("A single observation in Ally's voice. Plain, specific, not preachy."),
-  evidenceRefs: z7.array(evidenceRefSchema).describe("Where this observation comes from. Never leave empty \u2014 if there's no evidence, don't write the fact.")
+var keyFactSchema = z8.object({
+  statement: z8.string().describe("A single observation in Ally's voice. Plain, specific, not preachy."),
+  evidenceRefs: z8.array(evidenceRefSchema).describe("Where this observation comes from. Never leave empty \u2014 if there's no evidence, don't write the fact.")
 });
-var factsSectionSchema = z7.object({
-  id: z7.string().describe("Slug \u2014 'income' | 'spending' | 'family_obligations' | 'whats_missing' | etc. Stable across generations so re-renders can re-use claims."),
-  salience: z7.number().int().min(1).max(10).describe("How much this section matters for THIS person. 10 = opens or near-opens the story. 1 = mention in passing. Drives dynamic ordering."),
-  emotionalRegister: z7.enum(["gentle", "honest", "warm", "hopeful", "grounding", "celebratory", "matter_of_fact"]).describe("Tone this section should land with \u2014 set by what the user revealed in conversation."),
-  headline: z7.string().describe("One-sentence summary in Ally's voice. The essence of this section if the user read nothing else."),
-  keyFacts: z7.array(keyFactSchema),
-  gaps: z7.array(z7.string()).describe("What we DON'T know in this area but would want to. These seed future notes/questions \u2014 they do not become claims in this draft.")
+var factsSectionSchema = z8.object({
+  id: z8.string().describe("Slug \u2014 'income' | 'spending' | 'family_obligations' | 'whats_missing' | etc. Stable across generations so re-renders can re-use claims."),
+  salience: z8.number().int().min(1).max(10).describe("How much this section matters for THIS person. 10 = opens or near-opens the story. 1 = mention in passing. Drives dynamic ordering."),
+  emotionalRegister: z8.enum(["gentle", "honest", "warm", "hopeful", "grounding", "celebratory", "matter_of_fact"]).describe("Tone this section should land with \u2014 set by what the user revealed in conversation."),
+  headline: z8.string().describe("One-sentence summary in Ally's voice. The essence of this section if the user read nothing else."),
+  keyFacts: z8.array(keyFactSchema),
+  gaps: z8.array(z8.string()).describe("What we DON'T know in this area but would want to. These seed future notes/questions \u2014 they do not become claims in this draft.")
 });
-var analysisFactsSchema = z7.object({
-  openingRecognition: z7.object({
-    whatTheyreCarrying: z7.string().describe("The emotional weight the user is holding, named specifically. Draws from what they revealed in conversation. NOT data \u2014 the feeling behind the data. Example: 'You just signed a bond. It's bigger than you expected, and you're carrying three people who are depending on you working out.'"),
-    emotionalRegister: z7.enum(["gentle", "honest", "warm", "hopeful", "grounding", "celebratory", "matter_of_fact"])
+var analysisFactsSchema = z8.object({
+  openingRecognition: z8.object({
+    whatTheyreCarrying: z8.string().describe("The emotional weight the user is holding, named specifically. Draws from what they revealed in conversation. NOT data \u2014 the feeling behind the data. Example: 'You just signed a bond. It's bigger than you expected, and you're carrying three people who are depending on you working out.'"),
+    emotionalRegister: z8.enum(["gentle", "honest", "warm", "hopeful", "grounding", "celebratory", "matter_of_fact"])
   }),
-  emotionalTrajectory: z7.enum([
+  emotionalTrajectory: z8.enum([
     "heavy_to_light",
     "steady",
     "celebratory",
     "grounding",
     "challenging_but_hopeful"
   ]).describe("The arc the story/comic should follow, per PRD \xA76.5. Most users: heavy_to_light."),
-  sections: z7.array(factsSectionSchema).describe("Dynamic \u2014 only include sections this user has evidence for. Ordered by salience descending. Expect 4-8 sections; not every user gets every category."),
-  notesToRaise: z7.array(z7.object({
-    anchorId: z7.string().describe("Stable slug, e.g. 'note_retirement' or 'note_house_bond'. Prose and panels reference these when they emit note-kind annotations."),
-    category: z7.string().describe("'house' | 'retirement' | 'medical_aid' | 'crypto' | 'goals' | 'family' | etc."),
-    label: z7.string().describe("Short title for the note, e.g. 'Retirement'"),
-    body: z7.string().describe("Short factual body, e.g. 'Provident fund through employer, no visible contributions outside that.'"),
-    evidenceRefs: z7.array(evidenceRefSchema)
+  sections: z8.array(factsSectionSchema).describe("Dynamic \u2014 only include sections this user has evidence for. Ordered by salience descending. Expect 4-8 sections; not every user gets every category."),
+  notesToRaise: z8.array(z8.object({
+    anchorId: z8.string().describe("Stable slug, e.g. 'note_retirement' or 'note_house_bond'. Prose and panels reference these when they emit note-kind annotations."),
+    category: z8.string().describe("'house' | 'retirement' | 'medical_aid' | 'crypto' | 'goals' | 'family' | etc."),
+    label: z8.string().describe("Short title for the note, e.g. 'Retirement'"),
+    body: z8.string().describe("Short factual body, e.g. 'Provident fund through employer, no visible contributions outside that.'"),
+    evidenceRefs: z8.array(evidenceRefSchema)
   })).describe("The facts that should become Notes / Record of Advice entries \u2014 dated, attributed, referenceable.")
 });
-var annotationSchema2 = z7.object({
-  kind: z7.enum(["explain", "note"]),
-  phrase: z7.string().describe("The exact text substring from the surrounding copy to highlight. Must appear verbatim in the paragraph/anchor text."),
-  anchorId: z7.string().describe("Stable id referencing a claim (explain) or note (note). Prose and panels MAY share anchor ids when they reference the same underlying fact.")
+var annotationSchema2 = z8.object({
+  kind: z8.enum(["explain", "note"]),
+  phrase: z8.string().describe("The exact text substring from the surrounding copy to highlight. Must appear verbatim in the paragraph/anchor text."),
+  anchorId: z8.string().describe("Stable id referencing a claim (explain) or note (note). Prose and panels MAY share anchor ids when they reference the same underlying fact.")
 });
-var proseParagraphSchema = z7.object({
-  text: z7.string(),
-  annotations: z7.array(annotationSchema2).default([])
+var proseParagraphSchema = z8.object({
+  text: z8.string(),
+  annotations: z8.array(annotationSchema2).default([])
 });
-var proseSectionSchema = z7.object({
-  id: z7.string().describe("Matches the facts section id."),
-  heading: z7.string().optional().describe("Optional \u2014 many sections work better without one. Only use when it earns its place."),
-  paragraphs: z7.array(proseParagraphSchema)
+var proseSectionSchema = z8.object({
+  id: z8.string().describe("Matches the facts section id."),
+  heading: z8.string().optional().describe("Optional \u2014 many sections work better without one. Only use when it earns its place."),
+  paragraphs: z8.array(proseParagraphSchema)
 });
-var analysisProseSchema = z7.object({
-  sections: z7.array(proseSectionSchema).describe("Ordered. The first section IS the opening recognition \u2014 it must not open with numbers or financial facts."),
-  explainClaims: z7.array(z7.object({
-    anchorId: z7.string(),
-    label: z7.string().describe("The pill/highlight copy."),
-    body: z7.string().describe("One-sentence restatement of the claim, shown in Explain mode header."),
-    evidenceRefs: z7.array(evidenceRefSchema),
-    chartKind: z7.enum([
+var analysisProseSchema = z8.object({
+  sections: z8.array(proseSectionSchema).describe("Ordered. The first section IS the opening recognition \u2014 it must not open with numbers or financial facts."),
+  explainClaims: z8.array(z8.object({
+    anchorId: z8.string(),
+    label: z8.string().describe("The pill/highlight copy."),
+    body: z8.string().describe("One-sentence restatement of the claim, shown in Explain mode header."),
+    evidenceRefs: z8.array(evidenceRefSchema),
+    chartKind: z8.enum([
       "none",
       "balance_by_month",
       "spend_by_category",
@@ -2647,16 +3056,16 @@ var analysisProseSchema = z7.object({
     ]).describe("Which evidence visual (if any) Explain mode should render. 'none' = text + transactions only.")
   })).describe("Every explain-kind annotation in the prose must have a matching claim here.")
 });
-var proportionSchema = z7.object({
-  parts: z7.array(z7.object({
-    label: z7.string(),
-    weight: z7.number().describe("Relative weight \u2014 the renderer normalises these to fractions.")
+var proportionSchema = z8.object({
+  parts: z8.array(z8.object({
+    label: z8.string(),
+    weight: z8.number().describe("Relative weight \u2014 the renderer normalises these to fractions.")
   }))
 });
-var panelBeatSchema = z7.object({
-  id: z7.string().describe("Stable id, e.g. 'income_shape', 'bond_weight'. Matches facts section ids when the step is tied to one."),
-  anchorCopy: z7.string().describe("ONE short sentence \u2014 the line of text under/beside the panel illustration. Under ~90 chars."),
-  metaphor: z7.enum([
+var panelBeatSchema = z8.object({
+  id: z8.string().describe("Stable id, e.g. 'income_shape', 'bond_weight'. Matches facts section ids when the step is tied to one."),
+  anchorCopy: z8.string().describe("ONE short sentence \u2014 the line of text under/beside the panel illustration. Under ~90 chars."),
+  metaphor: z8.enum([
     "tap_and_basin",
     "holes_in_basin",
     "shield",
@@ -2672,16 +3081,16 @@ var panelBeatSchema = z7.object({
     "none"
   ]).describe("The visual metaphor to use. 'none' = copy-only step (opener or step of silence). Extend the enum only when a new metaphor is earned."),
   proportion: proportionSchema.optional().describe("Optional proportional visual (e.g., income vs commitments). Rendered deterministically."),
-  annotations: z7.array(annotationSchema2).default([])
+  annotations: z8.array(annotationSchema2).default([])
 });
-var analysisPanelsSchema = z7.object({
-  beats: z7.array(panelBeatSchema).describe("Ordered top-to-bottom. The first step IS the opening recognition."),
-  explainClaims: z7.array(z7.object({
-    anchorId: z7.string(),
-    label: z7.string(),
-    body: z7.string(),
-    evidenceRefs: z7.array(evidenceRefSchema),
-    chartKind: z7.enum([
+var analysisPanelsSchema = z8.object({
+  beats: z8.array(panelBeatSchema).describe("Ordered top-to-bottom. The first step IS the opening recognition."),
+  explainClaims: z8.array(z8.object({
+    anchorId: z8.string(),
+    label: z8.string(),
+    body: z8.string(),
+    evidenceRefs: z8.array(evidenceRefSchema),
+    chartKind: z8.enum([
       "none",
       "balance_by_month",
       "spend_by_category",
@@ -2690,19 +3099,19 @@ var analysisPanelsSchema = z7.object({
     ])
   })).describe("Every explain-kind annotation in panels must have a matching claim here. MAY duplicate prose claims if the same anchor is used in both formats.")
 });
-var analysisChatTurnSchema = z7.object({
-  reply: z7.string().describe("Ally's response to the user in plain conversational text. One-to-three paragraphs."),
-  action: z7.enum([
+var analysisChatTurnSchema = z8.object({
+  reply: z8.string().describe("Ally's response to the user in plain conversational text. One-to-three paragraphs."),
+  action: z8.enum([
     "reply_only",
     "request_regenerate",
     "mark_complete"
   ]).describe("What this turn should do. reply_only = conversation continues. request_regenerate = the user has corrected something substantive and Ally will rewrite the draft. mark_complete = the user has agreed the draft is right (moves to 'agreed')."),
-  regenerateReason: z7.string().optional().describe("When action=request_regenerate, the short reason that will drive the next generation pass \u2014 a plain-language summary of what changed."),
-  noteUpdates: z7.array(z7.object({
-    category: z7.string(),
-    label: z7.string(),
-    body: z7.string(),
-    evidenceRefs: z7.array(evidenceRefSchema).default([])
+  regenerateReason: z8.string().optional().describe("When action=request_regenerate, the short reason that will drive the next generation pass \u2014 a plain-language summary of what changed."),
+  noteUpdates: z8.array(z8.object({
+    category: z8.string(),
+    label: z8.string(),
+    body: z8.string(),
+    evidenceRefs: z8.array(evidenceRefSchema).default([])
   })).default([]).describe("Notes established or updated on this turn. Each becomes a new Record-of-Advice entry; prior versions stay in history.")
 });
 
@@ -2868,7 +3277,7 @@ function addAnnotation(acc, ann, prose, panels, facts) {
 }
 
 // server/modules/analysisDraft/refresh.ts
-import { and as and11, desc as desc10, eq as eq15, isNull as isNull3 } from "drizzle-orm";
+import { and as and12, desc as desc10, eq as eq16, isNull as isNull3 } from "drizzle-orm";
 function summariseStatements2(rows) {
   return rows.map((s) => {
     const r = s.extractionResult ?? null;
@@ -2882,11 +3291,11 @@ function summariseStatements2(rows) {
   });
 }
 async function refreshCanvas2Draft(userId) {
-  const [c1Conversation] = await db.select().from(conversations).where(eq15(conversations.userId, userId)).orderBy(desc10(conversations.updatedAt)).limit(1);
+  const [c1Conversation] = await db.select().from(conversations).where(eq16(conversations.userId, userId)).orderBy(desc10(conversations.updatedAt)).limit(1);
   if (!c1Conversation) throw new Error("no_conversation");
-  const [c1Analysis] = await db.select().from(analyses).where(and11(eq15(analyses.userId, userId), eq15(analyses.status, "done"))).orderBy(desc10(analyses.createdAt)).limit(1);
+  const [c1Analysis] = await db.select().from(analyses).where(and12(eq16(analyses.userId, userId), eq16(analyses.status, "done"))).orderBy(desc10(analyses.createdAt)).limit(1);
   if (!c1Analysis) throw new Error("no_analysis");
-  const userStatements = await db.select().from(statements).where(eq15(statements.userId, userId));
+  const userStatements = await db.select().from(statements).where(eq16(statements.userId, userId));
   const [factsPrompt, prosePrompt, panelsPrompt] = await Promise.all([
     getActivePrompt("analysis_facts"),
     getActivePrompt("analysis_prose"),
@@ -2896,8 +3305,8 @@ async function refreshCanvas2Draft(userId) {
     throw new Error("no_active_prompts");
   }
   await db.update(analysisDrafts).set({ status: "superseded", supersededAt: /* @__PURE__ */ new Date() }).where(
-    and11(
-      eq15(analysisDrafts.userId, userId),
+    and12(
+      eq16(analysisDrafts.userId, userId),
       isNull3(analysisDrafts.supersededAt)
     )
   );
@@ -2931,7 +3340,7 @@ async function refreshCanvas2Draft(userId) {
         cacheCreationTokens: out.usage.cacheCreationTokens,
         promptVersionIds: out.promptVersionIds,
         generatedAt: /* @__PURE__ */ new Date()
-      }).where(eq15(analysisDrafts.id, created.id));
+      }).where(eq16(analysisDrafts.id, created.id));
       if (out.claims.length > 0) {
         await db.insert(analysisClaims).values(
           out.claims.map((c) => ({
@@ -2948,7 +3357,7 @@ async function refreshCanvas2Draft(userId) {
     } catch (err) {
       const message = err instanceof Error ? err.message : "unknown_error";
       console.error("[refreshCanvas2Draft] build failed:", err);
-      await db.update(analysisDrafts).set({ status: "failed", errorMessage: message }).where(eq15(analysisDrafts.id, created.id));
+      await db.update(analysisDrafts).set({ status: "failed", errorMessage: message }).where(eq16(analysisDrafts.id, created.id));
     }
   })();
   return { draftId: created.id, status: "thinking" };
@@ -2970,7 +3379,7 @@ function summariseStatements3(rows) {
   });
 }
 async function getCurrentDraft(userId) {
-  const [row] = await db.select().from(analysisDrafts).where(and12(eq16(analysisDrafts.userId, userId), isNull4(analysisDrafts.supersededAt))).orderBy(desc11(analysisDrafts.createdAt)).limit(1);
+  const [row] = await db.select().from(analysisDrafts).where(and13(eq17(analysisDrafts.userId, userId), isNull4(analysisDrafts.supersededAt))).orderBy(desc11(analysisDrafts.createdAt)).limit(1);
   return row ?? null;
 }
 router7.post("/api/analysis-draft/generate", async (req, res) => {
@@ -2979,11 +3388,11 @@ router7.post("/api/analysis-draft/generate", async (req, res) => {
   if (existing && existing.status !== "failed") {
     return res.json(existing);
   }
-  const [c1Conversation] = await db.select().from(conversations).where(and12(eq16(conversations.userId, user.id), eq16(conversations.status, "complete"))).orderBy(desc11(conversations.completedAt)).limit(1);
+  const [c1Conversation] = await db.select().from(conversations).where(and13(eq17(conversations.userId, user.id), eq17(conversations.status, "complete"))).orderBy(desc11(conversations.completedAt)).limit(1);
   if (!c1Conversation) return res.status(400).json({ error: "canvas_1_not_agreed" });
-  const [c1Analysis] = await db.select().from(analyses).where(and12(eq16(analyses.userId, user.id), eq16(analyses.status, "done"))).orderBy(desc11(analyses.createdAt)).limit(1);
+  const [c1Analysis] = await db.select().from(analyses).where(and13(eq17(analyses.userId, user.id), eq17(analyses.status, "done"))).orderBy(desc11(analyses.createdAt)).limit(1);
   if (!c1Analysis) return res.status(400).json({ error: "no_analysis" });
-  const userStatements = await db.select().from(statements).where(eq16(statements.userId, user.id));
+  const userStatements = await db.select().from(statements).where(eq17(statements.userId, user.id));
   const [factsPrompt, prosePrompt, panelsPrompt] = await Promise.all([
     getActivePrompt("analysis_facts"),
     getActivePrompt("analysis_prose"),
@@ -3027,7 +3436,7 @@ router7.post("/api/analysis-draft/generate", async (req, res) => {
       cacheCreationTokens: out.usage.cacheCreationTokens,
       promptVersionIds: out.promptVersionIds,
       generatedAt: /* @__PURE__ */ new Date()
-    }).where(and12(eq16(analysisDrafts.id, created.id), eq16(analysisDrafts.userId, user.id))).returning();
+    }).where(and13(eq17(analysisDrafts.id, created.id), eq17(analysisDrafts.userId, user.id))).returning();
     if (out.claims.length > 0) {
       await db.insert(analysisClaims).values(
         out.claims.map((c) => ({
@@ -3069,7 +3478,7 @@ router7.post("/api/analysis-draft/generate", async (req, res) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : "unknown_error";
     console.error("[analysis_draft.generate] build failed:", err);
-    await db.update(analysisDrafts).set({ status: "failed", errorMessage: message }).where(and12(eq16(analysisDrafts.id, created.id), eq16(analysisDrafts.userId, user.id)));
+    await db.update(analysisDrafts).set({ status: "failed", errorMessage: message }).where(and13(eq17(analysisDrafts.id, created.id), eq17(analysisDrafts.userId, user.id)));
     audit({
       req,
       action: "analysis_draft.generate.failure",
@@ -3090,7 +3499,7 @@ router7.get("/api/analysis-draft/:id", async (req, res) => {
   const user = req.user;
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
-  const [row] = await db.select().from(analysisDrafts).where(and12(eq16(analysisDrafts.id, id), eq16(analysisDrafts.userId, user.id))).limit(1);
+  const [row] = await db.select().from(analysisDrafts).where(and13(eq17(analysisDrafts.id, id), eq17(analysisDrafts.userId, user.id))).limit(1);
   if (!row) return res.status(404).json({ error: "not_found" });
   res.json(row);
 });
@@ -3098,17 +3507,17 @@ router7.post("/api/analysis-draft/:id/agree", async (req, res) => {
   const user = req.user;
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
-  const [row] = await db.select().from(analysisDrafts).where(and12(eq16(analysisDrafts.id, id), eq16(analysisDrafts.userId, user.id))).limit(1);
+  const [row] = await db.select().from(analysisDrafts).where(and13(eq17(analysisDrafts.id, id), eq17(analysisDrafts.userId, user.id))).limit(1);
   if (!row) return res.status(404).json({ error: "not_found" });
   if (row.status !== "ready") {
     return res.status(400).json({ error: "not_ready", status: row.status });
   }
-  const [agreed] = await db.update(analysisDrafts).set({ status: "agreed", agreedAt: /* @__PURE__ */ new Date() }).where(and12(eq16(analysisDrafts.id, id), eq16(analysisDrafts.userId, user.id))).returning();
+  const [agreed] = await db.update(analysisDrafts).set({ status: "agreed", agreedAt: /* @__PURE__ */ new Date() }).where(and13(eq17(analysisDrafts.id, id), eq17(analysisDrafts.userId, user.id))).returning();
   await db.update(analysisConversations).set({ status: "complete", completedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(
-    and12(
-      eq16(analysisConversations.userId, user.id),
-      eq16(analysisConversations.draftId, id),
-      eq16(analysisConversations.status, "active")
+    and13(
+      eq17(analysisConversations.userId, user.id),
+      eq17(analysisConversations.draftId, id),
+      eq17(analysisConversations.status, "active")
     )
   );
   audit({
@@ -3123,12 +3532,12 @@ router7.post("/api/analysis-draft/:id/reopen", async (req, res) => {
   const user = req.user;
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
-  const [row] = await db.select().from(analysisDrafts).where(and12(eq16(analysisDrafts.id, id), eq16(analysisDrafts.userId, user.id))).limit(1);
+  const [row] = await db.select().from(analysisDrafts).where(and13(eq17(analysisDrafts.id, id), eq17(analysisDrafts.userId, user.id))).limit(1);
   if (!row) return res.status(404).json({ error: "not_found" });
   if (row.status !== "ready" && row.status !== "agreed") {
     return res.status(400).json({ error: "not_reopenable", status: row.status });
   }
-  await db.update(analysisDrafts).set({ status: "superseded", supersededAt: /* @__PURE__ */ new Date() }).where(and12(eq16(analysisDrafts.id, id), eq16(analysisDrafts.userId, user.id)));
+  await db.update(analysisDrafts).set({ status: "superseded", supersededAt: /* @__PURE__ */ new Date() }).where(and13(eq17(analysisDrafts.id, id), eq17(analysisDrafts.userId, user.id)));
   audit({
     req,
     action: "analysis_draft.reopen",
@@ -3157,17 +3566,17 @@ router7.get("/api/analysis-draft/:id/claims", async (req, res) => {
   const user = req.user;
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
-  const [draft] = await db.select().from(analysisDrafts).where(and12(eq16(analysisDrafts.id, id), eq16(analysisDrafts.userId, user.id))).limit(1);
+  const [draft] = await db.select().from(analysisDrafts).where(and13(eq17(analysisDrafts.id, id), eq17(analysisDrafts.userId, user.id))).limit(1);
   if (!draft) return res.status(404).json({ error: "not_found" });
-  const rows = await db.select().from(analysisClaims).where(eq16(analysisClaims.draftId, id));
+  const rows = await db.select().from(analysisClaims).where(eq17(analysisClaims.draftId, id));
   res.json(rows);
 });
 var analysisDraft_default = router7;
 
 // server/routes/analysisConversation.ts
 import { Router as Router8 } from "express";
-import { z as z8 } from "zod";
-import { and as and13, asc as asc3, desc as desc12, eq as eq17 } from "drizzle-orm";
+import { z as z9 } from "zod";
+import { and as and14, asc as asc3, desc as desc12, eq as eq18 } from "drizzle-orm";
 
 // server/modules/analysisDraft/chat.ts
 async function runAnalysisChatTurn(input) {
@@ -3216,9 +3625,9 @@ router8.use(isAuthenticated);
 var MAX_HISTORY_MESSAGES2 = 16;
 router8.get("/api/analysis-conversation", async (req, res) => {
   const user = req.user;
-  const [conv] = await db.select().from(analysisConversations).where(eq17(analysisConversations.userId, user.id)).orderBy(desc12(analysisConversations.startedAt)).limit(1);
+  const [conv] = await db.select().from(analysisConversations).where(eq18(analysisConversations.userId, user.id)).orderBy(desc12(analysisConversations.startedAt)).limit(1);
   if (!conv) return res.json({ conversation: null, messages: [] });
-  const [latestMsg] = await db.select({ createdAt: analysisConversationMessages.createdAt }).from(analysisConversationMessages).where(eq17(analysisConversationMessages.analysisConversationId, conv.id)).orderBy(desc12(analysisConversationMessages.createdAt)).limit(1);
+  const [latestMsg] = await db.select({ createdAt: analysisConversationMessages.createdAt }).from(analysisConversationMessages).where(eq18(analysisConversationMessages.analysisConversationId, conv.id)).orderBy(desc12(analysisConversationMessages.createdAt)).limit(1);
   if (conv.status === "active" && isStale(latestMsg?.createdAt ?? null)) {
     await onStateChange({
       userId: user.id,
@@ -3232,12 +3641,12 @@ router8.get("/api/analysis-conversation", async (req, res) => {
 });
 router8.post("/api/analysis-conversation/start", async (req, res) => {
   const user = req.user;
-  const [draft] = await db.select().from(analysisDrafts).where(and13(eq17(analysisDrafts.userId, user.id), eq17(analysisDrafts.status, "ready"))).orderBy(desc12(analysisDrafts.createdAt)).limit(1);
+  const [draft] = await db.select().from(analysisDrafts).where(and14(eq18(analysisDrafts.userId, user.id), eq18(analysisDrafts.status, "ready"))).orderBy(desc12(analysisDrafts.createdAt)).limit(1);
   if (!draft) return res.status(400).json({ error: "no_ready_draft" });
   const [existing] = await db.select().from(analysisConversations).where(
-    and13(
-      eq17(analysisConversations.userId, user.id),
-      eq17(analysisConversations.draftId, draft.id)
+    and14(
+      eq18(analysisConversations.userId, user.id),
+      eq18(analysisConversations.draftId, draft.id)
     )
   ).limit(1);
   if (existing) {
@@ -3266,8 +3675,8 @@ If anything's off, tell me and I'll fix it. When it lands right, tap "This is me
   });
   res.json({ conversation: created, messages: [opener] });
 });
-var messageBodySchema2 = z8.object({
-  content: z8.string().min(1).max(5e3)
+var messageBodySchema2 = z9.object({
+  content: z9.string().min(1).max(5e3)
 });
 router8.post("/api/analysis-conversation/message", async (req, res) => {
   const user = req.user;
@@ -3276,13 +3685,13 @@ router8.post("/api/analysis-conversation/message", async (req, res) => {
     return res.status(400).json({ error: "invalid_input", detail: parsed.error.flatten() });
   }
   const [conv] = await db.select().from(analysisConversations).where(
-    and13(
-      eq17(analysisConversations.userId, user.id),
-      eq17(analysisConversations.status, "active")
+    and14(
+      eq18(analysisConversations.userId, user.id),
+      eq18(analysisConversations.status, "active")
     )
   ).orderBy(desc12(analysisConversations.startedAt)).limit(1);
   if (!conv) return res.status(404).json({ error: "no_active_conversation" });
-  const [draft] = await db.select().from(analysisDrafts).where(and13(eq17(analysisDrafts.id, conv.draftId), eq17(analysisDrafts.userId, user.id))).limit(1);
+  const [draft] = await db.select().from(analysisDrafts).where(and14(eq18(analysisDrafts.id, conv.draftId), eq18(analysisDrafts.userId, user.id))).limit(1);
   if (!draft || draft.status !== "ready" && draft.status !== "agreed") {
     return res.status(400).json({ error: "draft_not_available", status: draft?.status });
   }
@@ -3302,7 +3711,7 @@ router8.post("/api/analysis-conversation/message", async (req, res) => {
   const allMessages = await loadMessages2(conv.id);
   const priorHistory = allMessages.filter((m) => m.id !== userMsg.id).map((m) => ({ role: m.role, content: m.content }));
   const history = priorHistory.slice(-MAX_HISTORY_MESSAGES2);
-  const noteRows = await db.select().from(analysisClaims).where(and13(eq17(analysisClaims.draftId, draft.id), eq17(analysisClaims.kind, "note")));
+  const noteRows = await db.select().from(analysisClaims).where(and14(eq18(analysisClaims.draftId, draft.id), eq18(analysisClaims.kind, "note")));
   const notes = noteRows.map((n) => ({
     category: n.category ?? "other",
     label: n.label,
@@ -3381,8 +3790,8 @@ router8.post("/api/analysis-conversation/message", async (req, res) => {
         resourceId: String(conv.id)
       });
     }
-    await db.update(analysisConversations).set({ updatedAt: /* @__PURE__ */ new Date() }).where(eq17(analysisConversations.id, conv.id));
-    const [updatedConv] = await db.select().from(analysisConversations).where(eq17(analysisConversations.id, conv.id)).limit(1);
+    await db.update(analysisConversations).set({ updatedAt: /* @__PURE__ */ new Date() }).where(eq18(analysisConversations.id, conv.id));
+    const [updatedConv] = await db.select().from(analysisConversations).where(eq18(analysisConversations.id, conv.id)).limit(1);
     res.json({
       conversation: updatedConv,
       userMessage: userMsg,
@@ -3405,7 +3814,7 @@ router8.post("/api/analysis-conversation/message", async (req, res) => {
   }
 });
 async function loadMessages2(conversationId) {
-  return db.select().from(analysisConversationMessages).where(eq17(analysisConversationMessages.analysisConversationId, conversationId)).orderBy(
+  return db.select().from(analysisConversationMessages).where(eq18(analysisConversationMessages.analysisConversationId, conversationId)).orderBy(
     asc3(analysisConversationMessages.createdAt),
     asc3(analysisConversationMessages.id)
   );
@@ -3414,27 +3823,27 @@ var analysisConversation_default = router8;
 
 // server/routes/subStep.ts
 import { Router as Router9 } from "express";
-import { z as z9 } from "zod";
-import { and as and15, asc as asc4, desc as desc14, eq as eq19, isNull as isNull6, sql as sql3 } from "drizzle-orm";
+import { z as z10 } from "zod";
+import { and as and16, asc as asc4, desc as desc14, eq as eq20, isNull as isNull6, sql as sql3 } from "drizzle-orm";
 
 // server/modules/subStep/orchestrator.ts
-import { and as and14, desc as desc13, eq as eq18, isNull as isNull5 } from "drizzle-orm";
+import { and as and15, desc as desc13, eq as eq19, isNull as isNull5 } from "drizzle-orm";
 async function getCurrentSubStep(userId) {
   const existing = await currentForUser(userId);
   if (existing) return existing;
   return await lazyBackfill(userId);
 }
 async function currentForUser(userId) {
-  const rows = await db.select().from(subSteps).where(and14(eq18(subSteps.userId, userId), isNull5(subSteps.supersededAt))).orderBy(desc13(subSteps.startedAt)).limit(1);
+  const rows = await db.select().from(subSteps).where(and15(eq19(subSteps.userId, userId), isNull5(subSteps.supersededAt))).orderBy(desc13(subSteps.startedAt)).limit(1);
   return rows[0] ?? null;
 }
 async function lazyBackfill(userId) {
-  const [user] = await db.select().from(users).where(eq18(users.id, userId)).limit(1);
+  const [user] = await db.select().from(users).where(eq19(users.id, userId)).limit(1);
   if (!user) throw new Error(`User not found: ${userId}`);
-  const stmts = await db.select().from(statements).where(eq18(statements.userId, userId));
-  const [latestAnalysis] = await db.select().from(analyses).where(and14(eq18(analyses.userId, userId), eq18(analyses.status, "done"))).orderBy(desc13(analyses.createdAt)).limit(1);
-  const [conv] = await db.select().from(conversations).where(eq18(conversations.userId, userId)).limit(1);
-  const [latestDraft] = await db.select().from(analysisDrafts).where(and14(eq18(analysisDrafts.userId, userId), isNull5(analysisDrafts.supersededAt))).orderBy(desc13(analysisDrafts.createdAt)).limit(1);
+  const stmts = await db.select().from(statements).where(eq19(statements.userId, userId));
+  const [latestAnalysis] = await db.select().from(analyses).where(and15(eq19(analyses.userId, userId), eq19(analyses.status, "done"))).orderBy(desc13(analyses.createdAt)).limit(1);
+  const [conv] = await db.select().from(conversations).where(eq19(conversations.userId, userId)).limit(1);
+  const [latestDraft] = await db.select().from(analysisDrafts).where(and15(eq19(analysisDrafts.userId, userId), isNull5(analysisDrafts.supersededAt))).orderBy(desc13(analysisDrafts.createdAt)).limit(1);
   const derived = deriveCurrentFromLegacy({
     hasStatements: stmts.length > 0,
     hasBuildCompletedAt: !!user.buildCompletedAt,
@@ -3528,11 +3937,11 @@ function deriveCurrentFromLegacy(input) {
   };
 }
 async function advanceSubStep(userId, currentId, options = {}) {
-  const [current] = await db.select().from(subSteps).where(and14(eq18(subSteps.id, currentId), eq18(subSteps.userId, userId))).limit(1);
+  const [current] = await db.select().from(subSteps).where(and15(eq19(subSteps.id, currentId), eq19(subSteps.userId, userId))).limit(1);
   if (!current) throw new Error("sub-step not found");
   const nextStep = nextStepAfter(current.step);
   if (!nextStep) throw new Error(`no step after ${current.step}`);
-  await db.update(subSteps).set({ status: "agreed", agreedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq18(subSteps.id, current.id));
+  await db.update(subSteps).set({ status: "agreed", agreedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq19(subSteps.id, current.id));
   const [created] = await db.insert(subSteps).values({
     userId,
     phaseKey: current.phaseKey,
@@ -3546,10 +3955,10 @@ async function advanceSubStep(userId, currentId, options = {}) {
   return created;
 }
 async function agreeSubStep(userId, currentId) {
-  const [current] = await db.select().from(subSteps).where(and14(eq18(subSteps.id, currentId), eq18(subSteps.userId, userId))).limit(1);
+  const [current] = await db.select().from(subSteps).where(and15(eq19(subSteps.id, currentId), eq19(subSteps.userId, userId))).limit(1);
   if (!current) throw new Error("sub-step not found");
   if (current.step !== "discuss") throw new Error("can only agree a discuss step");
-  await db.update(subSteps).set({ status: "agreed", agreedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq18(subSteps.id, current.id));
+  await db.update(subSteps).set({ status: "agreed", agreedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq19(subSteps.id, current.id));
   const [live] = await db.insert(subSteps).values({
     userId,
     phaseKey: current.phaseKey,
@@ -3563,10 +3972,10 @@ async function agreeSubStep(userId, currentId) {
   return live;
 }
 async function reopenSubStep(userId, currentId) {
-  const [current] = await db.select().from(subSteps).where(and14(eq18(subSteps.id, currentId), eq18(subSteps.userId, userId))).limit(1);
+  const [current] = await db.select().from(subSteps).where(and15(eq19(subSteps.id, currentId), eq19(subSteps.userId, userId))).limit(1);
   if (!current) throw new Error("sub-step not found");
   if (current.step !== "live") throw new Error("can only reopen a live step");
-  await db.update(subSteps).set({ status: "superseded", supersededAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq18(subSteps.id, current.id));
+  await db.update(subSteps).set({ status: "superseded", supersededAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(eq19(subSteps.id, current.id));
   const [discuss] = await db.insert(subSteps).values({
     userId,
     phaseKey: current.phaseKey,
@@ -3580,10 +3989,10 @@ async function reopenSubStep(userId, currentId) {
   return discuss;
 }
 async function markAnalyseError(userId, subStepId, errorMessage) {
-  await db.update(subSteps).set({ errorMessage, updatedAt: /* @__PURE__ */ new Date() }).where(and14(eq18(subSteps.id, subStepId), eq18(subSteps.userId, userId)));
+  await db.update(subSteps).set({ errorMessage, updatedAt: /* @__PURE__ */ new Date() }).where(and15(eq19(subSteps.id, subStepId), eq19(subSteps.userId, userId)));
 }
 async function clearAnalyseError(userId, subStepId) {
-  await db.update(subSteps).set({ errorMessage: null, updatedAt: /* @__PURE__ */ new Date() }).where(and14(eq18(subSteps.id, subStepId), eq18(subSteps.userId, userId)));
+  await db.update(subSteps).set({ errorMessage: null, updatedAt: /* @__PURE__ */ new Date() }).where(and15(eq19(subSteps.id, subStepId), eq19(subSteps.userId, userId)));
 }
 function nextStepAfter(step) {
   if (step === "gather") return "draft";
@@ -3617,7 +4026,7 @@ router9.post("/api/sub-step/:id/advance", async (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
   try {
-    const [prior] = await db.select().from(subSteps).where(and15(eq19(subSteps.id, id), eq19(subSteps.userId, user.id))).limit(1);
+    const [prior] = await db.select().from(subSteps).where(and16(eq20(subSteps.id, id), eq20(subSteps.userId, user.id))).limit(1);
     const next = await advanceSubStep(user.id, id);
     audit({
       req,
@@ -3651,7 +4060,7 @@ router9.get("/api/sub-step/:id/checklist", async (req, res) => {
   const user = req.user;
   const id = Number.parseInt(req.params.id, 10);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
-  const [sub] = await db.select().from(subSteps).where(and15(eq19(subSteps.id, id), eq19(subSteps.userId, user.id))).limit(1);
+  const [sub] = await db.select().from(subSteps).where(and16(eq20(subSteps.id, id), eq20(subSteps.userId, user.id))).limit(1);
   if (!sub) return res.status(404).json({ error: "not_found" });
   try {
     const checklist = await deriveChecklist(user.id, sub);
@@ -3661,12 +4070,12 @@ router9.get("/api/sub-step/:id/checklist", async (req, res) => {
     res.status(500).json({ error: "checklist_failed", message });
   }
 });
-var skipBodySchema = z9.object({
-  itemKey: z9.string().min(1),
-  itemLabel: z9.string().min(1),
+var skipBodySchema = z10.object({
+  itemKey: z10.string().min(1),
+  itemLabel: z10.string().min(1),
   // Reason is optional — the user may skip without giving one. We record the
   // absence so the audit trail still shows the explicit choice.
-  reason: z9.string().max(500).optional()
+  reason: z10.string().max(500).optional()
 });
 router9.post("/api/sub-step/:id/skip", async (req, res) => {
   const user = req.user;
@@ -3676,7 +4085,7 @@ router9.post("/api/sub-step/:id/skip", async (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: "invalid_input", detail: parsed.error.flatten() });
   }
-  const [sub] = await db.select().from(subSteps).where(and15(eq19(subSteps.id, id), eq19(subSteps.userId, user.id))).limit(1);
+  const [sub] = await db.select().from(subSteps).where(and16(eq20(subSteps.id, id), eq20(subSteps.userId, user.id))).limit(1);
   if (!sub) return res.status(404).json({ error: "not_found" });
   const reason = parsed.data.reason?.trim() || null;
   await writeNote({
@@ -3699,9 +4108,9 @@ router9.post("/api/sub-step/:id/skip", async (req, res) => {
   });
   res.json({ ok: true });
 });
-var discussTopicSchema = z9.object({
-  itemKey: z9.string().min(1),
-  itemLabel: z9.string().optional()
+var discussTopicSchema = z10.object({
+  itemKey: z10.string().min(1),
+  itemLabel: z10.string().optional()
 });
 router9.post("/api/sub-step/:id/discuss-topic", async (req, res) => {
   const user = req.user;
@@ -3711,7 +4120,7 @@ router9.post("/api/sub-step/:id/discuss-topic", async (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: "invalid_input", detail: parsed.error.flatten() });
   }
-  const [sub] = await db.select().from(subSteps).where(and15(eq19(subSteps.id, id), eq19(subSteps.userId, user.id))).limit(1);
+  const [sub] = await db.select().from(subSteps).where(and16(eq20(subSteps.id, id), eq20(subSteps.userId, user.id))).limit(1);
   if (!sub) return res.status(404).json({ error: "not_found" });
   await onStateChange({
     userId: user.id,
@@ -3740,12 +4149,12 @@ router9.post("/api/sub-step/:id/agree", async (req, res) => {
   try {
     const live = await agreeSubStep(user.id, id);
     if (live.phaseKey === "picture") {
-      await db.update(conversations).set({ status: "complete", completedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(and15(eq19(conversations.userId, user.id), eq19(conversations.status, "active")));
+      await db.update(conversations).set({ status: "complete", completedAt: /* @__PURE__ */ new Date(), updatedAt: /* @__PURE__ */ new Date() }).where(and16(eq20(conversations.userId, user.id), eq20(conversations.status, "active")));
     } else if (live.phaseKey === "analysis") {
       const content = live.contentJson ?? {};
       if (content.draftId) {
         await db.update(analysisDrafts).set({ status: "agreed", agreedAt: /* @__PURE__ */ new Date() }).where(
-          and15(eq19(analysisDrafts.id, content.draftId), eq19(analysisDrafts.userId, user.id))
+          and16(eq20(analysisDrafts.id, content.draftId), eq20(analysisDrafts.userId, user.id))
         );
       }
     }
@@ -3787,7 +4196,7 @@ router9.post("/api/sub-step/:id/reopen", async (req, res) => {
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
   try {
     const discuss = await reopenSubStep(user.id, id);
-    await db.update(conversations).set({ status: "active", completedAt: null, updatedAt: /* @__PURE__ */ new Date() }).where(eq19(conversations.userId, user.id));
+    await db.update(conversations).set({ status: "active", completedAt: null, updatedAt: /* @__PURE__ */ new Date() }).where(eq20(conversations.userId, user.id));
     audit({
       req,
       action: "sub_step.reopen",
@@ -3814,12 +4223,12 @@ router9.post("/api/sub-step/:id/retry", async (req, res) => {
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid_id" });
   await clearAnalyseError(user.id, id);
   audit({ req, action: "sub_step.retry", resourceType: "sub_step", resourceId: String(id) });
-  const [fresh] = await db.select().from(subSteps).where(eq19(subSteps.id, id)).limit(1);
+  const [fresh] = await db.select().from(subSteps).where(eq20(subSteps.id, id)).limit(1);
   if (fresh) void maybeKickoffAnalyse(user.id, fresh);
   res.json({ ok: true });
 });
-var messageBodySchema3 = z9.object({
-  content: z9.string().min(1).max(5e3)
+var messageBodySchema3 = z10.object({
+  content: z10.string().min(1).max(5e3)
 });
 router9.post("/api/sub-step/:id/message", async (req, res) => {
   const user = req.user;
@@ -3829,7 +4238,7 @@ router9.post("/api/sub-step/:id/message", async (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: "invalid_input", detail: parsed.error.flatten() });
   }
-  const [sub] = await db.select().from(subSteps).where(and15(eq19(subSteps.id, id), eq19(subSteps.userId, user.id))).limit(1);
+  const [sub] = await db.select().from(subSteps).where(and16(eq20(subSteps.id, id), eq20(subSteps.userId, user.id))).limit(1);
   if (!sub) return res.status(404).json({ error: "not_found" });
   if (sub.phaseKey !== "picture" || sub.step !== "discuss") {
     return res.status(400).json({ error: "chat_not_supported_for_beat" });
@@ -3838,12 +4247,12 @@ router9.post("/api/sub-step/:id/message", async (req, res) => {
   res.json({ subStep: sub, userMessage: userMsg });
 });
 async function loadMessages3(subStepId) {
-  return db.select().from(subStepMessages).where(eq19(subStepMessages.subStepId, subStepId)).orderBy(asc4(subStepMessages.createdAt), asc4(subStepMessages.id));
+  return db.select().from(subStepMessages).where(eq20(subStepMessages.subStepId, subStepId)).orderBy(asc4(subStepMessages.createdAt), asc4(subStepMessages.id));
 }
 async function runPictureAnalyse(userId, subStepId) {
-  const [sub] = await db.select().from(subSteps).where(eq19(subSteps.id, subStepId)).limit(1);
+  const [sub] = await db.select().from(subSteps).where(eq20(subSteps.id, subStepId)).limit(1);
   if (!sub || sub.step !== "draft" || sub.phaseKey !== "picture") return;
-  const sts = await db.select().from(statements).where(and15(eq19(statements.userId, userId), eq19(statements.status, "extracted")));
+  const sts = await db.select().from(statements).where(and16(eq20(statements.userId, userId), eq20(statements.status, "extracted")));
   if (sts.length === 0) {
     await markAnalyseError(userId, subStepId, "no_statements");
     return;
@@ -3859,11 +4268,28 @@ async function runPictureAnalyse(userId, subStepId) {
     promptVersionId: prompt.id,
     sourceStatementIds: sts.map((s) => s.id)
   }).returning();
+  const rules = await loadActiveRules(userId);
+  const allTransactions = [];
+  for (const s of sts) {
+    const ext = s.extractionResult;
+    for (const t of ext?.transactions ?? []) {
+      allTransactions.push({
+        date: t.date,
+        description: t.description,
+        amount: t.amount,
+        direction: t.direction,
+        statementFile: s.filename
+      });
+    }
+  }
+  const { aggregatesBySubject } = applyReinterpretations(allTransactions, rules);
   try {
     const { result, usage } = await analyseStatements({
       systemPrompt: prompt.content,
       model: prompt.model,
-      statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult }))
+      statements: sts.map((s) => ({ filename: s.filename, extraction: s.extractionResult })),
+      subjectAggregates: aggregatesBySubject,
+      rawTransactions: allTransactions
     });
     await db.update(analyses).set({
       status: "done",
@@ -3873,12 +4299,12 @@ async function runPictureAnalyse(userId, subStepId) {
       cacheReadTokens: usage.cacheReadTokens,
       cacheCreationTokens: usage.cacheCreationTokens,
       completedAt: /* @__PURE__ */ new Date()
-    }).where(eq19(analyses.id, analysis.id));
+    }).where(eq20(analyses.id, analysis.id));
     await persistCanvas1Claims(analysis.id, result);
     await db.update(subSteps).set({
       contentJson: { analysisId: analysis.id },
       updatedAt: /* @__PURE__ */ new Date()
-    }).where(eq19(subSteps.id, subStepId));
+    }).where(eq20(subSteps.id, subStepId));
     onStateChange({
       userId,
       trigger: "analyse_completed",
@@ -3893,7 +4319,7 @@ async function runPictureAnalyse(userId, subStepId) {
   } catch (err) {
     const message = err instanceof Error ? err.message : "unknown_error";
     console.error("[runPictureAnalyse] failed:", err);
-    await db.update(analyses).set({ status: "failed", errorMessage: message, completedAt: /* @__PURE__ */ new Date() }).where(eq19(analyses.id, analysis.id));
+    await db.update(analyses).set({ status: "failed", errorMessage: message, completedAt: /* @__PURE__ */ new Date() }).where(eq20(analyses.id, analysis.id));
     await markAnalyseError(userId, subStepId, message);
   }
 }
@@ -3948,9 +4374,9 @@ async function releaseAnalyseClaim(subStepId) {
 }
 async function startCanvas2ForUser(userId) {
   const [existing] = await db.select().from(subSteps).where(
-    and15(
-      eq19(subSteps.userId, userId),
-      eq19(subSteps.phaseKey, "analysis"),
+    and16(
+      eq20(subSteps.userId, userId),
+      eq20(subSteps.phaseKey, "analysis"),
       isNull6(subSteps.supersededAt)
     )
   ).limit(1);
@@ -3970,7 +4396,7 @@ async function startCanvas2ForUser(userId) {
   );
 }
 async function runAnalysisAnalyse(userId, subStepId) {
-  const [sub] = await db.select().from(subSteps).where(eq19(subSteps.id, subStepId)).limit(1);
+  const [sub] = await db.select().from(subSteps).where(eq20(subSteps.id, subStepId)).limit(1);
   if (!sub || sub.phaseKey !== "analysis" || sub.step !== "draft") return;
   const [factsPrompt, prosePrompt, panelsPrompt] = await Promise.all([
     getActivePrompt("analysis_facts"),
@@ -3981,17 +4407,17 @@ async function runAnalysisAnalyse(userId, subStepId) {
     await markAnalyseError(userId, subStepId, "no_active_analysis_prompts");
     return;
   }
-  const [c1Conversation] = await db.select().from(conversations).where(and15(eq19(conversations.userId, userId), eq19(conversations.status, "complete"))).orderBy(desc14(conversations.completedAt)).limit(1);
+  const [c1Conversation] = await db.select().from(conversations).where(and16(eq20(conversations.userId, userId), eq20(conversations.status, "complete"))).orderBy(desc14(conversations.completedAt)).limit(1);
   if (!c1Conversation) {
     await markAnalyseError(userId, subStepId, "canvas_1_not_agreed");
     return;
   }
-  const [c1Analysis] = await db.select().from(analyses).where(and15(eq19(analyses.userId, userId), eq19(analyses.status, "done"))).orderBy(desc14(analyses.createdAt)).limit(1);
+  const [c1Analysis] = await db.select().from(analyses).where(and16(eq20(analyses.userId, userId), eq20(analyses.status, "done"))).orderBy(desc14(analyses.createdAt)).limit(1);
   if (!c1Analysis) {
     await markAnalyseError(userId, subStepId, "no_canvas_1_analysis");
     return;
   }
-  const userStatements = await db.select().from(statements).where(eq19(statements.userId, userId));
+  const userStatements = await db.select().from(statements).where(eq20(statements.userId, userId));
   const [draft] = await db.insert(analysisDrafts).values({
     userId,
     sourceConversationId: c1Conversation.id,
@@ -4021,7 +4447,7 @@ async function runAnalysisAnalyse(userId, subStepId) {
       cacheCreationTokens: out.usage.cacheCreationTokens,
       promptVersionIds: out.promptVersionIds,
       generatedAt: /* @__PURE__ */ new Date()
-    }).where(eq19(analysisDrafts.id, draft.id));
+    }).where(eq20(analysisDrafts.id, draft.id));
     if (out.claims.length > 0) {
       await db.insert(analysisClaims).values(
         out.claims.map((c) => ({
@@ -4053,7 +4479,7 @@ async function runAnalysisAnalyse(userId, subStepId) {
     await db.update(subSteps).set({
       contentJson: { draftId: draft.id, analysisId: c1Analysis.id },
       updatedAt: /* @__PURE__ */ new Date()
-    }).where(eq19(subSteps.id, subStepId));
+    }).where(eq20(subSteps.id, subStepId));
     onStateChange({
       userId,
       trigger: "analyse_completed",
@@ -4073,7 +4499,7 @@ async function runAnalysisAnalyse(userId, subStepId) {
   } catch (err) {
     const message = err instanceof Error ? err.message : "unknown_error";
     console.error("[runAnalysisAnalyse] failed:", err);
-    await db.update(analysisDrafts).set({ status: "failed", errorMessage: message }).where(eq19(analysisDrafts.id, draft.id));
+    await db.update(analysisDrafts).set({ status: "failed", errorMessage: message }).where(eq20(analysisDrafts.id, draft.id));
     await markAnalyseError(userId, subStepId, message);
   }
 }
@@ -4113,7 +4539,7 @@ var subStep_default = router9;
 
 // server/routes/record.ts
 import { Router as Router10 } from "express";
-import { z as z10 } from "zod";
+import { z as z11 } from "zod";
 var router10 = Router10();
 router10.use(isAuthenticated);
 router10.get("/api/record", async (req, res) => {
@@ -4130,11 +4556,11 @@ router10.get("/api/record", async (req, res) => {
     res.status(500).json({ error: "record_load_failed", message });
   }
 });
-var listNotesQuery = z10.object({
-  segmentId: z10.coerce.number().optional(),
-  category: z10.string().optional(),
-  kind: z10.string().optional(),
-  limit: z10.coerce.number().min(1).max(500).optional()
+var listNotesQuery = z11.object({
+  segmentId: z11.coerce.number().optional(),
+  category: z11.string().optional(),
+  kind: z11.string().optional(),
+  limit: z11.coerce.number().min(1).max(500).optional()
 });
 router10.get("/api/record/notes", async (req, res) => {
   const user = req.user;
@@ -4166,19 +4592,19 @@ router10.get("/api/record/segments", async (req, res) => {
     res.status(500).json({ error: "segments_load_failed", message });
   }
 });
-var writeNoteBody = z10.object({
-  category: z10.string().optional(),
-  tags: z10.array(z10.string()).optional(),
-  kind: z10.string().min(1),
-  label: z10.string().min(1).max(200),
-  body: z10.string().max(1e4).optional(),
-  evidenceRefs: z10.unknown().optional(),
-  attributes: z10.unknown().optional(),
-  confidence: z10.number().min(0).max(1).optional(),
-  sourcePhase: z10.string().optional(),
-  sourceSubStepId: z10.number().optional(),
-  sourceMessageId: z10.number().optional(),
-  segmentIds: z10.array(z10.number()).optional()
+var writeNoteBody = z11.object({
+  category: z11.string().optional(),
+  tags: z11.array(z11.string()).optional(),
+  kind: z11.string().min(1),
+  label: z11.string().min(1).max(200),
+  body: z11.string().max(1e4).optional(),
+  evidenceRefs: z11.unknown().optional(),
+  attributes: z11.unknown().optional(),
+  confidence: z11.number().min(0).max(1).optional(),
+  sourcePhase: z11.string().optional(),
+  sourceSubStepId: z11.number().optional(),
+  sourceMessageId: z11.number().optional(),
+  segmentIds: z11.array(z11.number()).optional()
 });
 router10.post("/api/record/notes", async (req, res) => {
   const user = req.user;
