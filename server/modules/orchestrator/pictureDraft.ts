@@ -18,11 +18,13 @@
 
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../../db";
-import { analyses } from "@shared/schema";
+import { analyses, statements } from "@shared/schema";
 import { refreshCanvas1Analysis } from "../analysis/refresh";
+import { getActivePrompt } from "../prompts/getPrompt";
 import { BaseOrchestrator } from "./base";
 import {
   type OrchestratorState,
+  buildFailure,
   newOrchestratorState,
   setExpectedDuration,
   transitionStatus,
@@ -32,6 +34,9 @@ import type {
   ChatTurnResult,
   OrchestratorMeta,
   PhaseHandoff,
+  Precondition,
+  PreconditionResult,
+  TransitionTarget,
   UiAction,
   UiActionResult,
 } from "./types";
@@ -97,11 +102,10 @@ export class PictureDraftOrchestrator extends BaseOrchestrator {
 
     if (latest.status === "failed") {
       state = transitionStatus(state, "failed", "I hit a snag.", `failed (analysisId=${latest.id})`);
-      state.failure = {
-        kind: "analysis_failed",
-        recoverable: true,
-        message: latest.errorMessage ?? "Something went wrong while I was reading.",
-      };
+      state.failure = buildFailure(
+        classifyAnalysisError(latest.errorMessage),
+        { messageOverride: latest.errorMessage ?? undefined },
+      );
       return state;
     }
 
@@ -137,6 +141,61 @@ export class PictureDraftOrchestrator extends BaseOrchestrator {
     if (durations.length === 0) return null;
     durations.sort((a, b) => a - b);
     return Math.round(durations[Math.floor(durations.length / 2)]);
+  }
+
+  // --- KNOWING (continued): preconditions ------------------------------------
+  //
+  // Override the base canTransition() to add picture/draft's domain rules:
+  //   kickoff → must have at least one extracted statement + an active
+  //             analysis prompt; must not already be working
+  //   retry  → must be currently failed (and not in a permanent failure mode)
+  //   advance → must be done (only fires automatic step advance)
+  //
+  // We layer over `super.canTransition()` so the status-shape rules are
+  // preserved; concrete preconditions add to the failed list.
+
+  async canTransition(target: TransitionTarget): Promise<PreconditionResult> {
+    const base = await super.canTransition(target);
+    const failed: Precondition[] = base.satisfied ? [] : [...base.failed];
+
+    if (target.kind === "kickoff") {
+      const stmts = await db
+        .select({ id: statements.id })
+        .from(statements)
+        .where(and(eq(statements.userId, this.userId), eq(statements.status, "extracted")));
+      if (stmts.length === 0) {
+        failed.push({
+          code: "no_statements",
+          message: "I need at least one bank statement to read your year.",
+          resolveAction: "Upload a statement on the gather step.",
+        });
+      }
+
+      const prompt = await getActivePrompt("analysis");
+      if (!prompt) {
+        failed.push({
+          code: "no_active_prompt",
+          message: "I'm not configured to do this work right now.",
+          resolveAction: "Admin: activate an `analysis` prompt version.",
+        });
+      }
+    }
+
+    if (target.kind === "retry") {
+      const state = await this.getState();
+      if (state.failure && !state.failure.recoverable) {
+        failed.push({
+          code: "permanent_failure",
+          message:
+            state.failure.message ??
+            "The last attempt hit a permanent issue — retrying won't help.",
+          resolveAction: state.failure.adminMessage ?? "Admin attention needed.",
+        });
+      }
+    }
+
+    if (failed.length === 0) return { satisfied: true };
+    return { satisfied: false, failed };
   }
 
   // --- DOING -----------------------------------------------------------------
@@ -243,4 +302,31 @@ export class PictureDraftOrchestrator extends BaseOrchestrator {
   async handoffTo(_next: PhaseHandoff): Promise<OrchestratorState> {
     throw new Error("PictureDraftOrchestrator does not perform phase boundary handoff");
   }
+}
+
+// --- Helpers ---------------------------------------------------------------
+//
+// Map an analyses.errorMessage string into a FailureCode. Best-effort —
+// upstream callers (analyseStatements, refreshCanvas1Analysis) emit error
+// strings that we recognise. Anything unrecognised falls into unknown_error,
+// which is recoverable (we'll retry once via the queue when that lands).
+
+import type { FailureCode } from "./state";
+
+function classifyAnalysisError(message: string | null): FailureCode {
+  if (!message) return "unknown_error";
+  const m = message.toLowerCase();
+  if (m.includes("no_statements")) return "no_statements";
+  if (m.includes("no_active_analysis_prompt") || m.includes("no_active_prompt")) {
+    return "no_active_prompt";
+  }
+  if (m.includes("rate") && m.includes("limit")) return "anthropic_rate_limit";
+  if (m.includes("timeout") || m.includes("timed out")) return "anthropic_timeout";
+  if (m.includes("max_tokens") || m.includes("unterminated") || m.includes("max tokens")) {
+    return "anthropic_max_tokens";
+  }
+  if (m.includes("parse") || m.includes("structured output")) {
+    return "anthropic_parse_failed";
+  }
+  return "unknown_error";
 }

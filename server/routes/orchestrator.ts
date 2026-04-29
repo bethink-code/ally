@@ -1,4 +1,7 @@
 import { Router } from "express";
+import { and, desc, eq } from "drizzle-orm";
+import { db } from "../db";
+import { auditLogs } from "@shared/schema";
 import { isAuthenticated } from "../auth";
 import { PictureDraftOrchestrator } from "../modules/orchestrator/pictureDraft";
 
@@ -78,6 +81,68 @@ router.post("/api/orchestrator/:phase/:step/:subStepId/run", async (req, res) =>
     const message = err instanceof Error ? err.message : "unknown_error";
     console.error(`[orchestrator] run failed for ${phase}/${step}/${subStepId}:`, err);
     res.status(500).json({ error: "run_failed", message });
+  }
+});
+
+// GET /api/orchestrator/:phase/:step/:subStepId/report
+//
+// Bundle for support / admin tooling: current state + history + recent
+// audit_logs entries for this orchestrator + the precondition snapshot for
+// each transition target. Lighter version of "what happened with this user
+// at this step" — replaces hand-rolled SQL queries the team has been doing
+// when debugging stuck states.
+//
+// Does NOT include the artefact (analysis result) by default. Pass
+// ?includeArtefact=1 to add it, but that's heavy and only worth fetching
+// when actually inspecting the artefact.
+router.get("/api/orchestrator/:phase/:step/:subStepId/report", async (req, res) => {
+  const user = req.user as { id: string };
+  const { phase, step, subStepId } = req.params;
+  const subStepIdNum = Number.parseInt(subStepId, 10);
+  if (!Number.isFinite(subStepIdNum)) {
+    return res.status(400).json({ error: "invalid_sub_step_id" });
+  }
+  const orchestrator = pickOrchestrator(phase, step, user.id, subStepIdNum);
+  if (!orchestrator) {
+    return res.status(404).json({ error: "no_orchestrator", phase, step });
+  }
+  try {
+    const state = await orchestrator.getState();
+    const resourceId = `${phase}/${step}/${subStepId}`;
+    const recentAudits = await db
+      .select()
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.userId, user.id),
+          eq(auditLogs.resourceType, "orchestrator"),
+          eq(auditLogs.resourceId, resourceId),
+        ),
+      )
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(40);
+
+    // Precondition snapshot per known transition target. Lets support see
+    // "what's blocking agreement right now" without trial-and-error.
+    const preconditions = {
+      kickoff: await orchestrator.canTransition({ kind: "kickoff" }),
+      agree: await orchestrator.canTransition({ kind: "agree" }),
+      advance: await orchestrator.canTransition({ kind: "advance" }),
+      retry: await orchestrator.canTransition({ kind: "retry" }),
+    };
+
+    res.json({
+      state,
+      preconditions,
+      auditLog: recentAudits,
+      // Artefact deliberately omitted by default. Pass ?includeArtefact=1
+      // when debugging the actual content.
+      artefactIncluded: false,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "unknown_error";
+    console.error(`[orchestrator] report failed for ${phase}/${step}/${subStepId}:`, err);
+    res.status(500).json({ error: "report_failed", message });
   }
 });
 

@@ -35,6 +35,42 @@ export type UiAction =
   | { kind: "retry" }
   | { kind: "navigate_back" };
 
+// --- Transition targets + preconditions ------------------------------------
+//
+// `TransitionTarget` is a domain-level operation (kickoff the work, agree
+// the artefact, advance to next step, etc.), distinct from `UiAction` (which
+// is UI-shape specific). Concrete orchestrators declare preconditions per
+// transition target so business rules are checked BEFORE a UI action is
+// even offered.
+//
+// Example: PictureDiscussOrchestrator's `agree` requires the analysis to
+// be `done`, the checklist to have all critical items covered, and no
+// unresolved flagged issues. The orchestrator reports those gates back as
+// a `PreconditionResult` so the UI can render "you need to discuss X, Y,
+// Z before agreeing" rather than just disabling a button silently.
+
+export type TransitionTarget =
+  | { kind: "kickoff" } // start the step's work from idle
+  | { kind: "agree" } // user signs off — this artefact is right
+  | { kind: "advance" } // move to next step (often automatic on done)
+  | { kind: "reopen"; reason?: string } // re-open a previously agreed step
+  | { kind: "retry" }; // explicit retry after failure
+
+export type Precondition = {
+  // Stable identifier for the precondition. Used by the UI to map to copy
+  // and by tests to assert specific gates.
+  code: string;
+  // User-facing summary of what's missing or required.
+  message: string;
+  // Optional: the action the user (or admin) should take to resolve. Drives
+  // a CTA on the blocked UI surface.
+  resolveAction?: string;
+};
+
+export type PreconditionResult =
+  | { satisfied: true }
+  | { satisfied: false; failed: Precondition[] };
+
 // A phase boundary signal. When one phase's `live` step agrees, the
 // next phase's `gather` step's orchestrator gets handed control with
 // the prior artefact + agreement context.
@@ -114,8 +150,20 @@ export interface Orchestrator {
   getState(): Promise<OrchestratorState>;
 
   // Whether a given UI action is valid in the current state. Used by the
-  // UI to enable/disable controls without trial-and-error.
+  // UI to enable/disable controls without trial-and-error. Status-machine
+  // shape only — for business preconditions use canTransition().
   canDo(action: UiAction): Promise<boolean>;
+
+  // Rich precondition check for a domain-level transition. Returns
+  // satisfied=true OR a list of failed preconditions, each with a user-
+  // facing message and (where applicable) the resolve action. The UI
+  // uses this to render "you need to discuss X, Y, Z before agreeing"
+  // rather than just disabling a button silently.
+  //
+  // ALL transitions go through this before the orchestrator commits.
+  // The transition() side firing a target without a satisfied=true
+  // canTransition() check is a programming error.
+  canTransition(target: TransitionTarget): Promise<PreconditionResult>;
 
   // --- DOING ---
 

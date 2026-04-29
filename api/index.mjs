@@ -4744,6 +4744,7 @@ var tips_default = router11;
 
 // server/routes/orchestrator.ts
 import { Router as Router12 } from "express";
+import { and as and19, desc as desc16, eq as eq23 } from "drizzle-orm";
 
 // server/modules/orchestrator/pictureDraft.ts
 import { and as and18, desc as desc15, eq as eq22 } from "drizzle-orm";
@@ -4752,6 +4753,58 @@ import { and as and18, desc as desc15, eq as eq22 } from "drizzle-orm";
 import { and as and17, eq as eq21, isNull as isNull7 } from "drizzle-orm";
 
 // server/modules/orchestrator/state.ts
+var FAILURE_CODES = {
+  // Orchestrator preconditions (user_resolvable) ------------------------------
+  no_statements: {
+    kind: "user_resolvable",
+    recoverable: false,
+    // user must act first
+    defaultMessage: "I need at least one bank statement before I can read your year."
+  },
+  unresolved_flagged_issues: {
+    kind: "user_resolvable",
+    recoverable: false,
+    defaultMessage: "We've got a few things still to talk through before we agree this."
+  },
+  checklist_incomplete: {
+    kind: "user_resolvable",
+    recoverable: false,
+    defaultMessage: "There are still some topics we haven't covered."
+  },
+  // System preconditions (system) ---------------------------------------------
+  no_active_prompt: {
+    kind: "system",
+    recoverable: false,
+    defaultMessage: "I'm not configured to do this work right now. Try again shortly."
+  },
+  // Anthropic / LLM (mostly transient) ----------------------------------------
+  anthropic_timeout: {
+    kind: "transient",
+    recoverable: true,
+    defaultMessage: "Reading your statements is taking longer than usual \u2014 trying again."
+  },
+  anthropic_rate_limit: {
+    kind: "transient",
+    recoverable: true,
+    defaultMessage: "I'm temporarily over my limit. Trying again shortly."
+  },
+  anthropic_parse_failed: {
+    kind: "transient",
+    recoverable: true,
+    defaultMessage: "The reading didn't come back in a usable shape. Trying again."
+  },
+  anthropic_max_tokens: {
+    kind: "permanent",
+    recoverable: false,
+    defaultMessage: "I have too much to say and ran out of room. This needs a configuration change."
+  },
+  // Generic catch-all ---------------------------------------------------------
+  unknown_error: {
+    kind: "system",
+    recoverable: true,
+    defaultMessage: "Something went wrong. I'll try again."
+  }
+};
 function newOrchestratorState(input) {
   return {
     phase: input.phase,
@@ -4797,6 +4850,19 @@ function transitionStatus(state, next, message, event) {
     history: [...state.history, { timestamp: /* @__PURE__ */ new Date(), status: next, event }]
   };
 }
+function buildFailure(code, options = {}) {
+  const cat = FAILURE_CODES[code];
+  return {
+    code,
+    kind: cat.kind,
+    recoverable: cat.recoverable,
+    message: options.messageOverride ?? cat.defaultMessage,
+    adminMessage: options.adminMessage,
+    retryToken: options.retryToken,
+    occurredAt: /* @__PURE__ */ new Date(),
+    retryCount: (options.priorRetryCount ?? 0) + 1
+  };
+}
 function setExpectedDuration(state, seconds) {
   return { ...state, expectedDurationS: seconds };
 }
@@ -4819,16 +4885,95 @@ var BaseOrchestrator = class {
     const state = await this.getState();
     return this.isActionAllowed(state, action);
   }
+  /**
+   * Default `canTransition` implementation: checks status-machine validity
+   * only (kickoff requires idle/failed/done; agree requires done; etc.).
+   * Concrete orchestrators OVERRIDE to add business preconditions:
+   *   - artefact state checks (analysis must be done before agreeing)
+   *   - checklist gates (have we covered the 10 things?)
+   *   - flag checks (any unresolved flagged_issues?)
+   *   - upstream-phase agreement checks
+   *
+   * The pattern in concrete orchestrators is to call super.canTransition()
+   * to get the status-shape result, then layer domain checks on top, then
+   * return the merged result.
+   */
+  async canTransition(target) {
+    const state = await this.getState();
+    const failed = [];
+    switch (target.kind) {
+      case "kickoff":
+        if (state.status === "working" || state.status === "recovering") {
+          failed.push({
+            code: "already_working",
+            message: "I'm already on this \u2014 give me a moment."
+          });
+        }
+        break;
+      case "agree":
+        if (state.status !== "done") {
+          failed.push({
+            code: "not_done",
+            message: "This step isn't complete yet \u2014 there's still work to do before we can agree."
+          });
+        }
+        break;
+      case "advance":
+        if (state.status !== "done") {
+          failed.push({
+            code: "not_done",
+            message: "Can't move on yet \u2014 this step needs to finish first."
+          });
+        }
+        break;
+      case "reopen":
+        if (state.status !== "done") {
+          failed.push({
+            code: "not_agreed",
+            message: "This isn't agreed \u2014 there's nothing to re-open."
+          });
+        }
+        break;
+      case "retry":
+        if (state.status !== "failed") {
+          failed.push({
+            code: "not_failed",
+            message: "Nothing to retry \u2014 the last attempt didn't fail."
+          });
+        }
+        break;
+    }
+    if (failed.length === 0) return { satisfied: true };
+    return { satisfied: false, failed };
+  }
   // --- Helpers shared by concrete orchestrators ------------------------------
   /**
    * Wrap a state-mutating block in load + transition + persist + audit.
    * Concrete orchestrators use this whenever they advance status — keeps
-   * audit history honest and persistence atomic.
+   * the orchestrator's private history AND the system-wide audit_logs both
+   * up to date. Querying support tooling: filter audit_logs by
+   *   action='orchestrator.transition'
+   *   resourceType='orchestrator'
+   *   resourceId='<phase>/<step>/<subStepId>'
+   * to get every transition this orchestrator has emitted, across instances.
    */
   async transitionTo(next, message, event) {
     const current = await this.getState();
     const updated = transitionStatus(current, next, message, event);
     await this.persistState(updated);
+    audit({
+      userId: this.userId,
+      action: "orchestrator.transition",
+      resourceType: "orchestrator",
+      resourceId: `${this.meta.phase}/${this.meta.step}/${this.subStepId}`,
+      detail: {
+        from: current.status,
+        to: next,
+        event,
+        message,
+        failure: updated.failure ?? void 0
+      }
+    });
     return updated;
   }
   /**
@@ -4863,9 +5008,12 @@ var BaseOrchestrator = class {
       message: row.errorMessage ?? defaultMessageFor(mapped, row.phaseKey, row.step),
       startedAt: row.updatedAt,
       failure: row.errorMessage ? {
-        kind: "legacy_error",
+        code: "unknown_error",
+        kind: "system",
         recoverable: true,
-        message: row.errorMessage
+        message: row.errorMessage,
+        occurredAt: row.updatedAt ?? /* @__PURE__ */ new Date(),
+        retryCount: 1
       } : null
     };
   }
@@ -4979,11 +5127,10 @@ var PictureDraftOrchestrator = class extends BaseOrchestrator {
     }
     if (latest.status === "failed") {
       state = transitionStatus(state, "failed", "I hit a snag.", `failed (analysisId=${latest.id})`);
-      state.failure = {
-        kind: "analysis_failed",
-        recoverable: true,
-        message: latest.errorMessage ?? "Something went wrong while I was reading."
-      };
+      state.failure = buildFailure(
+        classifyAnalysisError(latest.errorMessage),
+        { messageOverride: latest.errorMessage ?? void 0 }
+      );
       return state;
     }
     state = transitionStatus(
@@ -5008,6 +5155,50 @@ var PictureDraftOrchestrator = class extends BaseOrchestrator {
     if (durations.length === 0) return null;
     durations.sort((a, b) => a - b);
     return Math.round(durations[Math.floor(durations.length / 2)]);
+  }
+  // --- KNOWING (continued): preconditions ------------------------------------
+  //
+  // Override the base canTransition() to add picture/draft's domain rules:
+  //   kickoff → must have at least one extracted statement + an active
+  //             analysis prompt; must not already be working
+  //   retry  → must be currently failed (and not in a permanent failure mode)
+  //   advance → must be done (only fires automatic step advance)
+  //
+  // We layer over `super.canTransition()` so the status-shape rules are
+  // preserved; concrete preconditions add to the failed list.
+  async canTransition(target) {
+    const base = await super.canTransition(target);
+    const failed = base.satisfied ? [] : [...base.failed];
+    if (target.kind === "kickoff") {
+      const stmts = await db.select({ id: statements.id }).from(statements).where(and18(eq22(statements.userId, this.userId), eq22(statements.status, "extracted")));
+      if (stmts.length === 0) {
+        failed.push({
+          code: "no_statements",
+          message: "I need at least one bank statement to read your year.",
+          resolveAction: "Upload a statement on the gather step."
+        });
+      }
+      const prompt = await getActivePrompt("analysis");
+      if (!prompt) {
+        failed.push({
+          code: "no_active_prompt",
+          message: "I'm not configured to do this work right now.",
+          resolveAction: "Admin: activate an `analysis` prompt version."
+        });
+      }
+    }
+    if (target.kind === "retry") {
+      const state = await this.getState();
+      if (state.failure && !state.failure.recoverable) {
+        failed.push({
+          code: "permanent_failure",
+          message: state.failure.message ?? "The last attempt hit a permanent issue \u2014 retrying won't help.",
+          resolveAction: state.failure.adminMessage ?? "Admin attention needed."
+        });
+      }
+    }
+    if (failed.length === 0) return { satisfied: true };
+    return { satisfied: false, failed };
   }
   // --- DOING -----------------------------------------------------------------
   /**
@@ -5098,6 +5289,23 @@ var PictureDraftOrchestrator = class extends BaseOrchestrator {
     throw new Error("PictureDraftOrchestrator does not perform phase boundary handoff");
   }
 };
+function classifyAnalysisError(message) {
+  if (!message) return "unknown_error";
+  const m = message.toLowerCase();
+  if (m.includes("no_statements")) return "no_statements";
+  if (m.includes("no_active_analysis_prompt") || m.includes("no_active_prompt")) {
+    return "no_active_prompt";
+  }
+  if (m.includes("rate") && m.includes("limit")) return "anthropic_rate_limit";
+  if (m.includes("timeout") || m.includes("timed out")) return "anthropic_timeout";
+  if (m.includes("max_tokens") || m.includes("unterminated") || m.includes("max tokens")) {
+    return "anthropic_max_tokens";
+  }
+  if (m.includes("parse") || m.includes("structured output")) {
+    return "anthropic_parse_failed";
+  }
+  return "unknown_error";
+}
 
 // server/routes/orchestrator.ts
 var router12 = Router12();
@@ -5149,6 +5357,47 @@ router12.post("/api/orchestrator/:phase/:step/:subStepId/run", async (req, res) 
     const message = err instanceof Error ? err.message : "unknown_error";
     console.error(`[orchestrator] run failed for ${phase}/${step}/${subStepId}:`, err);
     res.status(500).json({ error: "run_failed", message });
+  }
+});
+router12.get("/api/orchestrator/:phase/:step/:subStepId/report", async (req, res) => {
+  const user = req.user;
+  const { phase, step, subStepId } = req.params;
+  const subStepIdNum = Number.parseInt(subStepId, 10);
+  if (!Number.isFinite(subStepIdNum)) {
+    return res.status(400).json({ error: "invalid_sub_step_id" });
+  }
+  const orchestrator = pickOrchestrator(phase, step, user.id, subStepIdNum);
+  if (!orchestrator) {
+    return res.status(404).json({ error: "no_orchestrator", phase, step });
+  }
+  try {
+    const state = await orchestrator.getState();
+    const resourceId = `${phase}/${step}/${subStepId}`;
+    const recentAudits = await db.select().from(auditLogs).where(
+      and19(
+        eq23(auditLogs.userId, user.id),
+        eq23(auditLogs.resourceType, "orchestrator"),
+        eq23(auditLogs.resourceId, resourceId)
+      )
+    ).orderBy(desc16(auditLogs.createdAt)).limit(40);
+    const preconditions = {
+      kickoff: await orchestrator.canTransition({ kind: "kickoff" }),
+      agree: await orchestrator.canTransition({ kind: "agree" }),
+      advance: await orchestrator.canTransition({ kind: "advance" }),
+      retry: await orchestrator.canTransition({ kind: "retry" })
+    };
+    res.json({
+      state,
+      preconditions,
+      auditLog: recentAudits,
+      // Artefact deliberately omitted by default. Pass ?includeArtefact=1
+      // when debugging the actual content.
+      artefactIncluded: false
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "unknown_error";
+    console.error(`[orchestrator] report failed for ${phase}/${step}/${subStepId}:`, err);
+    res.status(500).json({ error: "report_failed", message });
   }
 });
 router12.post("/api/orchestrator/:phase/:step/:subStepId/action", async (req, res) => {

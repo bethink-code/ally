@@ -66,26 +66,43 @@ goes away.
    commands back through the orchestrator's methods.
 
 2. **Every status transition goes through `transitionStatus()`** so the
-   audit history is complete and illegal transitions throw loudly.
+   audit history is complete and illegal transitions throw loudly. Every
+   transition also writes to `audit_logs` via `transitionTo()` (queryable
+   by `resourceType='orchestrator'`, `resourceId='<phase>/<step>/<id>'`).
 
 3. **The orchestrator is the only thing that knows the rules.** Validation
    logic, transition-validity, what's-blocking — all live here. The chat
    doesn't decide; the UI doesn't decide. They ask.
 
-4. **Failure is a first-class status, not an exception.** When work fails,
-   the orchestrator catches and transitions to `failed` (recoverable=true
-   if a retry will help, false if not). Never let an exception bubble all
-   the way out and leave the state stuck.
+4. **Two layers of validation:**
+   - `canDo(action)` — boolean status-shape check for UI button enabling
+   - `canTransition(target)` — rich precondition check returning the list
+     of *failed* preconditions with user-facing messages and resolve
+     actions. Use this before firing any domain transition (kickoff /
+     agree / advance / reopen / retry).
 
-5. **`run()` is idempotent.** Concrete orchestrators must check whether
+5. **Failure is a first-class status with a typed catalogue.** When work
+   fails, the orchestrator transitions to `failed` (or `recovering` if a
+   retry will help) with a `failure` object built from `FAILURE_CODES`.
+   The catalogue is in `state.ts`; new codes added pragmatically as we
+   encounter real failure modes. Each carries a `kind`
+   (user_resolvable | transient | system | permanent), `recoverable`,
+   `message`, optional `adminMessage` for support context.
+
+6. **`run()` is idempotent.** Concrete orchestrators must check whether
    work is already in flight before starting. Re-running `run()` on a
    `working` status should be a no-op or a status check, not a duplicate
    execution.
 
-6. **State narration is part of the contract.** Every transition sets
+7. **State narration is part of the contract.** Every transition sets
    `message` to something a user can read. Concrete orchestrators provide
    step-specific copy ("I'm reading your year, Beryl…" — not the bridge
    default "Working on picture draft…").
+
+8. **Reportable.** `/api/orchestrator/<phase>/<step>/<subStepId>/report`
+   returns `{ state, preconditions, auditLog }` for support tooling and
+   admin debugging. Pass `?includeArtefact=1` for the full artefact
+   payload (heavy; only when needed).
 
 ## What's coming in subsequent PRs
 

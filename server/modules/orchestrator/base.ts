@@ -11,6 +11,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../../db";
 import { subSteps } from "@shared/schema";
+import { audit } from "../../auditLog";
 import {
   type OrchestratorState,
   type OrchestratorStatus,
@@ -24,6 +25,9 @@ import type {
   Orchestrator,
   OrchestratorMeta,
   PhaseHandoff,
+  Precondition,
+  PreconditionResult,
+  TransitionTarget,
   UiAction,
   UiActionResult,
 } from "./types";
@@ -70,6 +74,70 @@ export abstract class BaseOrchestrator implements Orchestrator {
     return this.isActionAllowed(state, action);
   }
 
+  /**
+   * Default `canTransition` implementation: checks status-machine validity
+   * only (kickoff requires idle/failed/done; agree requires done; etc.).
+   * Concrete orchestrators OVERRIDE to add business preconditions:
+   *   - artefact state checks (analysis must be done before agreeing)
+   *   - checklist gates (have we covered the 10 things?)
+   *   - flag checks (any unresolved flagged_issues?)
+   *   - upstream-phase agreement checks
+   *
+   * The pattern in concrete orchestrators is to call super.canTransition()
+   * to get the status-shape result, then layer domain checks on top, then
+   * return the merged result.
+   */
+  async canTransition(target: TransitionTarget): Promise<PreconditionResult> {
+    const state = await this.getState();
+    const failed: Precondition[] = [];
+
+    switch (target.kind) {
+      case "kickoff":
+        if (state.status === "working" || state.status === "recovering") {
+          failed.push({
+            code: "already_working",
+            message: "I'm already on this — give me a moment.",
+          });
+        }
+        break;
+      case "agree":
+        if (state.status !== "done") {
+          failed.push({
+            code: "not_done",
+            message: "This step isn't complete yet — there's still work to do before we can agree.",
+          });
+        }
+        break;
+      case "advance":
+        if (state.status !== "done") {
+          failed.push({
+            code: "not_done",
+            message: "Can't move on yet — this step needs to finish first.",
+          });
+        }
+        break;
+      case "reopen":
+        if (state.status !== "done") {
+          failed.push({
+            code: "not_agreed",
+            message: "This isn't agreed — there's nothing to re-open.",
+          });
+        }
+        break;
+      case "retry":
+        if (state.status !== "failed") {
+          failed.push({
+            code: "not_failed",
+            message: "Nothing to retry — the last attempt didn't fail.",
+          });
+        }
+        break;
+    }
+
+    if (failed.length === 0) return { satisfied: true };
+    return { satisfied: false, failed };
+  }
+
   // --- DOING (concrete orchestrators override these) -------------------------
 
   abstract run(): Promise<void>;
@@ -85,7 +153,12 @@ export abstract class BaseOrchestrator implements Orchestrator {
   /**
    * Wrap a state-mutating block in load + transition + persist + audit.
    * Concrete orchestrators use this whenever they advance status — keeps
-   * audit history honest and persistence atomic.
+   * the orchestrator's private history AND the system-wide audit_logs both
+   * up to date. Querying support tooling: filter audit_logs by
+   *   action='orchestrator.transition'
+   *   resourceType='orchestrator'
+   *   resourceId='<phase>/<step>/<subStepId>'
+   * to get every transition this orchestrator has emitted, across instances.
    */
   protected async transitionTo(
     next: OrchestratorStatus,
@@ -95,6 +168,19 @@ export abstract class BaseOrchestrator implements Orchestrator {
     const current = await this.getState();
     const updated = transitionStatus(current, next, message, event);
     await this.persistState(updated);
+    audit({
+      userId: this.userId,
+      action: "orchestrator.transition",
+      resourceType: "orchestrator",
+      resourceId: `${this.meta.phase}/${this.meta.step}/${this.subStepId}`,
+      detail: {
+        from: current.status,
+        to: next,
+        event,
+        message,
+        failure: updated.failure ?? undefined,
+      },
+    });
     return updated;
   }
 
@@ -144,9 +230,12 @@ export abstract class BaseOrchestrator implements Orchestrator {
       startedAt: row.updatedAt,
       failure: row.errorMessage
         ? {
-            kind: "legacy_error",
+            code: "unknown_error",
+            kind: "system" as const,
             recoverable: true,
             message: row.errorMessage,
+            occurredAt: row.updatedAt ?? new Date(),
+            retryCount: 1,
           }
         : null,
     };
