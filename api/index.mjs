@@ -4742,6 +4742,437 @@ router11.get("/api/tips", async (req, res) => {
 });
 var tips_default = router11;
 
+// server/routes/orchestrator.ts
+import { Router as Router12 } from "express";
+
+// server/modules/orchestrator/pictureDraft.ts
+import { and as and18, desc as desc15, eq as eq22 } from "drizzle-orm";
+
+// server/modules/orchestrator/base.ts
+import { and as and17, eq as eq21, isNull as isNull7 } from "drizzle-orm";
+
+// server/modules/orchestrator/state.ts
+function newOrchestratorState(input) {
+  return {
+    phase: input.phase,
+    step: input.step,
+    instance: input.instance,
+    status: "idle",
+    message: "Ready.",
+    startedAt: null,
+    expectedDurationS: null,
+    stage: null,
+    waitingOn: null,
+    blockedBy: null,
+    failure: null,
+    history: []
+  };
+}
+var VALID_TRANSITIONS = {
+  idle: ["working", "waiting", "blocked"],
+  working: ["done", "failed", "recovering", "waiting"],
+  waiting: ["working", "idle", "blocked"],
+  blocked: ["idle", "working"],
+  recovering: ["working", "failed"],
+  done: ["working", "idle"],
+  // re-entry: a re-opened beat goes back to working
+  failed: ["working"]
+  // explicit retry
+};
+function canTransitionStatus(from, to) {
+  if (from === to) return true;
+  return VALID_TRANSITIONS[from].includes(to);
+}
+function transitionStatus(state, next, message, event) {
+  if (!canTransitionStatus(state.status, next)) {
+    throw new Error(
+      `Illegal status transition: ${state.status} \u2192 ${next} (event: ${event})`
+    );
+  }
+  return {
+    ...state,
+    status: next,
+    message,
+    startedAt: next === "working" || next === "waiting" || next === "blocked" ? /* @__PURE__ */ new Date() : state.startedAt,
+    history: [...state.history, { timestamp: /* @__PURE__ */ new Date(), status: next, event }]
+  };
+}
+function setExpectedDuration(state, seconds) {
+  return { ...state, expectedDurationS: seconds };
+}
+
+// server/modules/orchestrator/base.ts
+var BaseOrchestrator = class {
+  userId;
+  subStepId;
+  constructor(userId, subStepId) {
+    this.userId = userId;
+    this.subStepId = subStepId;
+  }
+  // --- KNOWING ---
+  async getState() {
+    const [row] = await db.select().from(subSteps).where(and17(eq21(subSteps.id, this.subStepId), eq21(subSteps.userId, this.userId)));
+    if (!row) throw new Error(`sub_step ${this.subStepId} not found for user ${this.userId}`);
+    return this.hydrateState(row);
+  }
+  async canDo(action) {
+    const state = await this.getState();
+    return this.isActionAllowed(state, action);
+  }
+  // --- Helpers shared by concrete orchestrators ------------------------------
+  /**
+   * Wrap a state-mutating block in load + transition + persist + audit.
+   * Concrete orchestrators use this whenever they advance status — keeps
+   * audit history honest and persistence atomic.
+   */
+  async transitionTo(next, message, event) {
+    const current = await this.getState();
+    const updated = transitionStatus(current, next, message, event);
+    await this.persistState(updated);
+    return updated;
+  }
+  /**
+   * Set the orchestrator's ETA from historical durations. Concrete
+   * orchestrators call this when entering `working` status. Default
+   * implementation reads from analyses / analysis_drafts completedAt -
+   * createdAt across this user (or cohort fallback).
+   *
+   * Override per orchestrator if the duration model is different
+   * (e.g. plan-step durations don't have priors yet).
+   */
+  async setExpectedDurationFromHistory() {
+    const seconds = await this.computeHistoricalP50();
+    if (seconds == null) return;
+    const current = await this.getState();
+    await this.persistState(setExpectedDuration(current, seconds));
+  }
+  async computeHistoricalP50() {
+    return null;
+  }
+  // --- Persistence (provisional, replaced by migration) ----------------------
+  hydrateState(row) {
+    const initial = newOrchestratorState({
+      phase: row.phaseKey,
+      step: row.step,
+      instance: row.instance
+    });
+    const mapped = mapLegacyStatus(row.status, !!row.errorMessage);
+    return {
+      ...initial,
+      status: mapped,
+      message: row.errorMessage ?? defaultMessageFor(mapped, row.phaseKey, row.step),
+      startedAt: row.updatedAt,
+      failure: row.errorMessage ? {
+        kind: "legacy_error",
+        recoverable: true,
+        message: row.errorMessage
+      } : null
+    };
+  }
+  async persistState(state) {
+    const legacyStatus = mapToLegacyStatus(state.status);
+    await db.update(subSteps).set({
+      status: legacyStatus,
+      errorMessage: state.failure?.message ?? null,
+      updatedAt: /* @__PURE__ */ new Date(),
+      agreedAt: state.status === "done" ? state.startedAt ?? /* @__PURE__ */ new Date() : null
+    }).where(and17(eq21(subSteps.id, this.subStepId), isNull7(subSteps.supersededAt)));
+  }
+  isActionAllowed(state, action) {
+    switch (action.kind) {
+      case "cta_click":
+        return state.status !== "working" && state.status !== "recovering";
+      case "agree":
+        return state.status === "done";
+      case "reopen":
+        return state.status === "done";
+      case "retry":
+        return state.status === "failed";
+      case "navigate_back":
+        return true;
+    }
+  }
+};
+function mapLegacyStatus(legacy, hasError) {
+  if (hasError) return "failed";
+  switch (legacy) {
+    case "in_progress":
+      return "working";
+    case "agreed":
+      return "done";
+    case "paused":
+      return "waiting";
+    case "superseded":
+      return "done";
+    case "not_started":
+    default:
+      return "idle";
+  }
+}
+function mapToLegacyStatus(o) {
+  switch (o) {
+    case "working":
+    case "recovering":
+      return "in_progress";
+    case "done":
+      return "agreed";
+    case "waiting":
+    case "blocked":
+      return "paused";
+    case "failed":
+      return "in_progress";
+    // legacy has no `failed`; signalled via errorMessage
+    case "idle":
+    default:
+      return "not_started";
+  }
+}
+function defaultMessageFor(status, phase, step) {
+  if (status === "working") return `Working on ${phase} ${step}\u2026`;
+  if (status === "waiting") return "Waiting on you.";
+  if (status === "blocked") return "Can't proceed yet.";
+  if (status === "done") return "Done.";
+  if (status === "failed") return "Hit a snag.";
+  if (status === "recovering") return "Trying again.";
+  return "Ready.";
+}
+
+// server/modules/orchestrator/pictureDraft.ts
+var DEFAULT_ETA_SECONDS = 75;
+var PictureDraftOrchestrator = class extends BaseOrchestrator {
+  meta = {
+    phase: "picture",
+    step: "draft",
+    driver: "ally",
+    hasQueuedWork: true
+  };
+  // --- KNOWING ---------------------------------------------------------------
+  //
+  // Override the base hydrator: derive orchestrator state from the LATEST
+  // analyses row for this user, not from sub_steps.status. The analyses
+  // table is the source of truth for the work — sub_steps.status hasn't
+  // historically reflected mid-flight state accurately.
+  async getState() {
+    const [latest] = await db.select().from(analyses).where(eq22(analyses.userId, this.userId)).orderBy(desc15(analyses.createdAt)).limit(1);
+    let state = newOrchestratorState({ phase: "picture", step: "draft", instance: 1 });
+    if (!latest) {
+      state = transitionStatus(state, "idle", "Ready to read your statements.", "init");
+      state = setExpectedDuration(state, DEFAULT_ETA_SECONDS);
+      return state;
+    }
+    const expected = await this.computeHistoricalP50(latest.userId).catch(() => null);
+    state = setExpectedDuration(state, expected ?? DEFAULT_ETA_SECONDS);
+    if (latest.status === "analysing") {
+      state = transitionStatus(
+        state,
+        "working",
+        "I'm reading your year. This usually takes about a minute.",
+        `analysing (analysisId=${latest.id})`
+      );
+      state.startedAt = latest.createdAt;
+      const elapsedS = (Date.now() - new Date(latest.createdAt).getTime()) / 1e3;
+      const expectedS = state.expectedDurationS ?? DEFAULT_ETA_SECONDS;
+      if (elapsedS > expectedS * 3) {
+        state.message = "I'm still reading \u2014 this is taking longer than usual but I haven't hit a snag.";
+      }
+      return state;
+    }
+    if (latest.status === "failed") {
+      state = transitionStatus(state, "failed", "I hit a snag.", `failed (analysisId=${latest.id})`);
+      state.failure = {
+        kind: "analysis_failed",
+        recoverable: true,
+        message: latest.errorMessage ?? "Something went wrong while I was reading."
+      };
+      return state;
+    }
+    state = transitionStatus(
+      state,
+      "done",
+      "Read your year. Your first take is ready.",
+      `done (analysisId=${latest.id})`
+    );
+    state.startedAt = latest.completedAt ?? latest.createdAt;
+    return state;
+  }
+  // Override historical-duration computation: query analyses table for this
+  // user's prior completed runs and return the p50 duration. Falls back to
+  // null when the user has no completed priors (caller uses default).
+  async computeHistoricalP50(userId) {
+    const targetUser = userId ?? this.userId;
+    const rows = await db.select({
+      createdAt: analyses.createdAt,
+      completedAt: analyses.completedAt
+    }).from(analyses).where(and18(eq22(analyses.userId, targetUser), eq22(analyses.status, "done"))).orderBy(desc15(analyses.createdAt)).limit(10);
+    const durations = rows.filter((r) => r.completedAt && r.createdAt).map((r) => (new Date(r.completedAt).getTime() - new Date(r.createdAt).getTime()) / 1e3).filter((d) => d > 0 && d < 600);
+    if (durations.length === 0) return null;
+    durations.sort((a, b) => a - b);
+    return Math.round(durations[Math.floor(durations.length / 2)]);
+  }
+  // --- DOING -----------------------------------------------------------------
+  /**
+   * Kick off a fresh picture-draft pass. Idempotent: if work is already in
+   * flight, returns without spawning another. The actual work runs via
+   * refreshCanvas1Analysis (existing fire-and-forget); the orchestrator's
+   * state reflects the analyses-table progression.
+   *
+   * Called by:
+   *   - the StepController CTA when the user clicks "See your first take" or
+   *     "Carry on" on the picture/draft entry
+   *   - the qa chat's auto-refresh hook when triggerRefresh fires
+   *   - the sub-step background worker when picture/draft is the current step
+   *     (during its initial entry from picture/gather)
+   *
+   * Returns when the kickoff has been accepted (analyses row inserted, IIFE
+   * spawned) — does NOT wait for the work to complete.
+   */
+  async run() {
+    const current = await this.getState();
+    if (current.status === "working" || current.status === "recovering") {
+      return;
+    }
+    try {
+      await refreshCanvas1Analysis(this.userId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "unknown_error";
+      const recoverable = !["no_statements", "no_active_analysis_prompt"].includes(message);
+      console.error("[PictureDraftOrchestrator.run] precondition failed:", message, "recoverable:", recoverable);
+      throw err;
+    }
+  }
+  /**
+   * Picture-draft has no meaningful chat surface — chat lives on the
+   * discuss step. Any chat turn arriving here is misrouted; respond with
+   * an orientation reply rather than mutating state.
+   */
+  async onChatTurn(turn) {
+    const state = await this.getState();
+    return {
+      classification: { kind: "orientation", intent: "misrouted_chat_during_draft" },
+      reply: state.status === "working" ? "I'm reading your year right now \u2014 give me a moment and I'll be ready to talk it through." : "We can talk about this once I've finished reading. Open the conversation tab when the first take's ready.",
+      stateChangeNote: null,
+      newState: state
+    };
+  }
+  /**
+   * UI actions valid on picture/draft:
+   *   - cta_click (current relation): kick off run()
+   *   - cta_click (past relation):    re-run with current rules
+   *   - retry:                        explicit retry after failure
+   *   - navigate_back:                always allowed
+   * Other actions are rejected.
+   */
+  async onUiAction(action) {
+    const state = await this.getState();
+    const allowed = await this.canDo(action);
+    if (!allowed) {
+      return {
+        accepted: false,
+        reason: `${action.kind} not valid in status=${state.status}`,
+        newState: state
+      };
+    }
+    switch (action.kind) {
+      case "cta_click":
+      case "retry": {
+        await this.run();
+        return { accepted: true, newState: await this.getState() };
+      }
+      case "navigate_back":
+        return { accepted: true, newState: state };
+      default:
+        return {
+          accepted: false,
+          reason: `${action.kind} not handled by picture/draft orchestrator`,
+          newState: state
+        };
+    }
+  }
+  // --- BRIDGING --------------------------------------------------------------
+  //
+  // picture/draft → picture/discuss is internal to the picture phase; not a
+  // phase boundary. The phase boundary handoff (picture → analysis) lives
+  // on PictureLiveOrchestrator (when it ships in Phase B). For now this is
+  // a no-op that throws — picture/draft never hands off to a different phase.
+  async handoffTo(_next) {
+    throw new Error("PictureDraftOrchestrator does not perform phase boundary handoff");
+  }
+};
+
+// server/routes/orchestrator.ts
+var router12 = Router12();
+router12.use(isAuthenticated);
+var REGISTRY2 = {
+  "picture/draft": PictureDraftOrchestrator
+};
+function pickOrchestrator(phase, step, userId, subStepId) {
+  const ctor = REGISTRY2[`${phase}/${step}`];
+  if (!ctor) return null;
+  return new ctor(userId, subStepId);
+}
+router12.get("/api/orchestrator/:phase/:step/:subStepId/state", async (req, res) => {
+  const user = req.user;
+  const { phase, step, subStepId } = req.params;
+  const subStepIdNum = Number.parseInt(subStepId, 10);
+  if (!Number.isFinite(subStepIdNum)) {
+    return res.status(400).json({ error: "invalid_sub_step_id" });
+  }
+  const orchestrator = pickOrchestrator(phase, step, user.id, subStepIdNum);
+  if (!orchestrator) {
+    return res.status(404).json({ error: "no_orchestrator", phase, step });
+  }
+  try {
+    const state = await orchestrator.getState();
+    res.json(state);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "unknown_error";
+    console.error(`[orchestrator] getState failed for ${phase}/${step}/${subStepId}:`, err);
+    res.status(500).json({ error: "state_failed", message });
+  }
+});
+router12.post("/api/orchestrator/:phase/:step/:subStepId/run", async (req, res) => {
+  const user = req.user;
+  const { phase, step, subStepId } = req.params;
+  const subStepIdNum = Number.parseInt(subStepId, 10);
+  if (!Number.isFinite(subStepIdNum)) {
+    return res.status(400).json({ error: "invalid_sub_step_id" });
+  }
+  const orchestrator = pickOrchestrator(phase, step, user.id, subStepIdNum);
+  if (!orchestrator) {
+    return res.status(404).json({ error: "no_orchestrator", phase, step });
+  }
+  try {
+    await orchestrator.run();
+    const state = await orchestrator.getState();
+    res.json(state);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "unknown_error";
+    console.error(`[orchestrator] run failed for ${phase}/${step}/${subStepId}:`, err);
+    res.status(500).json({ error: "run_failed", message });
+  }
+});
+router12.post("/api/orchestrator/:phase/:step/:subStepId/action", async (req, res) => {
+  const user = req.user;
+  const { phase, step, subStepId } = req.params;
+  const subStepIdNum = Number.parseInt(subStepId, 10);
+  if (!Number.isFinite(subStepIdNum)) {
+    return res.status(400).json({ error: "invalid_sub_step_id" });
+  }
+  const orchestrator = pickOrchestrator(phase, step, user.id, subStepIdNum);
+  if (!orchestrator) {
+    return res.status(404).json({ error: "no_orchestrator", phase, step });
+  }
+  try {
+    const result = await orchestrator.onUiAction(req.body);
+    res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "unknown_error";
+    console.error(`[orchestrator] action failed for ${phase}/${step}/${subStepId}:`, err);
+    res.status(500).json({ error: "action_failed", message });
+  }
+});
+var orchestrator_default = router12;
+
 // server/routes/index.ts
 function registerRoutes(app2) {
   app2.use(auth_default);
@@ -4755,6 +5186,7 @@ function registerRoutes(app2) {
   app2.use(subStep_default);
   app2.use(record_default);
   app2.use(tips_default);
+  app2.use(orchestrator_default);
 }
 
 // server/api.ts
