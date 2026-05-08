@@ -10,6 +10,7 @@ import analysisConversationRouter from "./analysisConversation";
 import subStepRouter from "./subStep";
 import recordRouter from "./record";
 import tipsRouter from "./tips";
+import orchestratorRouter from "./orchestrator";
 
 export function registerRoutes(app: Express) {
   app.use(authRouter);
@@ -29,4 +30,7 @@ export function registerRoutes(app: Express) {
   app.use(recordRouter);
   // Personalised tips for wait-state rotators.
   app.use(tipsRouter);
+  // Orchestrator pattern (Phase A foundation). One endpoint per orchestrator
+  // method. Today only picture/draft is registered; more ship one at a time.
+  app.use(orchestratorRouter);
 }
